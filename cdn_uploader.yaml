@@ -1,4 +1,5 @@
 name: Embedding CDN Uploader.
+description: CDN Uploader
 inputs:
   - {name: embedding, type: Data, description: "Embedding JSON file to upload"}
   - {name: bearer_token, type: string, description: "Path to a file containing bearer token (will be read)"}
