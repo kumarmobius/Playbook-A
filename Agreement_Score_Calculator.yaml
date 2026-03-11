@@ -1,0 +1,175 @@
+name: Embedding Agreement Score Calculator
+inputs:
+  - {name: embedding, type: Data}
+
+outputs:
+  - {name: agreement_scores, type: Data}
+  - {name: pair_counts, type: Data}
+
+implementation:
+  container:
+    image: gurpreetgandhi/nesy-factory:v1
+    command:
+      - python3
+      - -u
+      - -c
+      - |
+        import argparse, os, sys, json, logging
+        import numpy as np
+        import pandas as pd
+
+        parser = argparse.ArgumentParser()
+        parser.add_argument('--embedding', required=True)
+        parser.add_argument('--agreement_scores', required=True)
+        parser.add_argument('--pair_counts', required=True)
+        args = parser.parse_args()
+
+        logging.basicConfig(stream=sys.stdout, level=logging.INFO)
+        logger = logging.getLogger("embedding_agreement_calculator")
+
+        # ============================================
+        # Field Config & Expected Dims
+        # ============================================
+        FIELD_CONFIG = {
+            'PESTLE_P':        ('Political Power',           ['Measurement & Statistical', 'Economic Coordination', 'Operational Reality', 'Regulatory & Enforcement'], False),
+            'PESTLE_E':        ('Measurement & Statistical', ['Economic Coordination', 'Operational Reality', 'Technological Production'],                              False),
+            'PESTLE_S':        ('Operational Reality',       ['Measurement & Statistical', 'Narrative & Legitimacy', 'Economic Coordination'],                          False),
+            'PESTLE_T':        ('Technological Production',  ['Measurement & Statistical', 'Economic Coordination', 'Operational Reality'],                              False),
+            'PESTLE_L':        ('Regulatory & Enforcement',  ['Political Power', 'Economic Coordination', 'Operational Reality'],                                       False),
+            'PESTLE_Env':      ('Narrative & Legitimacy',    ['Measurement & Statistical', 'Regulatory & Enforcement'],                                                 False),
+            '5F_Supplier':     ('Economic Coordination',     ['Regulatory & Enforcement', 'Incentive & Rent'],                                                          False),
+            '5F_Buyer':        ('Economic Coordination',     ['Operational Reality', 'Incentive & Rent'],                                                               False),
+            '5F_NewEntrant':   ('Regulatory & Enforcement',  ['Political Power', 'Economic Coordination', 'Technological Production'],                                  False),
+            '5F_Substitute':   ('Technological Production',  ['Economic Coordination', 'Operational Reality'],                                                          False),
+            '5F_Rivalry':      ('Economic Coordination',     ['Incentive & Rent', 'Regulatory & Enforcement'],                                                          False),
+            'Contractibility': ('Regulatory & Enforcement',  ['Operational Reality', 'Economic Coordination'],                                                          False),
+            'DataExhaust':     ('Technological Production',  ['Operational Reality', 'Economic Coordination'],                                                          False),
+            'StdGap':          ('Technological Production',  ['Regulatory & Enforcement'],                                                                              True),
+        }
+
+        EXPECTED_DIMS = {
+            'Political Power':           None,
+            'Measurement & Statistical': None,
+            'Economic Coordination':     None,
+            'Regulatory & Enforcement':  None,
+            'Technological Production':  None,
+            'Operational Reality':       None,
+            'Narrative & Legitimacy':    None,
+            'Incentive & Rent':          None,
+            'Temporal & Shock':          None,
+        }
+
+        # ============================================
+        # Core Logic
+        # ============================================
+        def load_embeddings(path: str) -> dict:
+            with open(path, 'r') as f:
+                raw = json.load(f)
+            return {
+                market: {regime: np.array(vec, dtype=np.float32) for regime, vec in regimes.items()}
+                for market, regimes in raw.items()
+            }
+
+        def validate_embeddings(regime_embeds: dict, expected_dims: dict) -> None:
+            for regime, vec in regime_embeds.items():
+                if expected_dims and expected_dims.get(regime) is not None:
+                    if vec.shape[0] != expected_dims[regime]:
+                        raise ValueError(f"Regime '{regime}': got dim={vec.shape[0]}, expected {expected_dims[regime]}")
+                if not np.isfinite(vec).all():
+                    raise ValueError(f"Non-finite values in regime '{regime}'")
+
+        def safe_cosine(a: np.ndarray, b: np.ndarray) -> float:
+            na, nb = np.linalg.norm(a), np.linalg.norm(b)
+            if na == 0 or nb == 0 or not np.isfinite(na) or not np.isfinite(nb):
+                return np.nan
+            return float(np.dot(a, b) / (na * nb))
+
+        def compute_agreement_scores(regime_embeds: dict, field_config: dict, expected_dims: dict) -> dict:
+            validate_embeddings(regime_embeds, expected_dims)
+            results = {}
+            for field, (target, others, inverted) in field_config.items():
+                if target not in regime_embeds:
+                    results[field] = {'agreement': np.nan, 'n_pairs': 0, 'inverted': inverted}
+                    continue
+                tgt  = regime_embeds[target]
+                sims = [safe_cosine(tgt, regime_embeds[o]) for o in others if o in regime_embeds]
+                sims = [s for s in sims if not np.isnan(s)]
+                if sims:
+                    raw = float(np.mean(sims))
+                    results[field] = {
+                        'agreement': (1.0 - raw) if inverted else raw,
+                        'n_pairs':   len(sims),
+                        'inverted':  inverted,
+                    }
+                else:
+                    results[field] = {'agreement': np.nan, 'n_pairs': 0, 'inverted': inverted}
+            return results
+
+        def build_dataframes(all_embeddings: dict, field_config: dict, expected_dims: dict):
+            agreement_rows, pairs_rows = [], []
+            for market, regime_embeds in all_embeddings.items():
+                scores = compute_agreement_scores(regime_embeds, field_config, expected_dims)
+                agreement_row = {'Market': market}
+                pairs_row     = {'Market': market}
+                for field, vals in scores.items():
+                    agreement_row[field]          = vals['agreement']
+                    pairs_row[f'{field}_n_pairs'] = vals['n_pairs']
+                agreement_rows.append(agreement_row)
+                pairs_rows.append(pairs_row)
+            df_agreement = pd.DataFrame(agreement_rows).set_index('Market')
+            df_pairs     = pd.DataFrame(pairs_rows).set_index('Market')
+            return df_agreement, df_pairs
+
+        try:
+            # ============================================
+            # Load embedding.json from input Data path
+            # ============================================
+            embedding_path = os.path.join(args.embedding, "embedding.json")
+            logger.info("Loading embeddings from: %s", embedding_path)
+
+            all_embeddings = load_embeddings(embedding_path)
+            logger.info("Loaded %d vectors across %d markets",
+                        sum(len(v) for v in all_embeddings.values()), len(all_embeddings))
+
+            # ============================================
+            # Compute Agreement Scores
+            # ============================================
+            df_agreement, df_pairs = build_dataframes(all_embeddings, FIELD_CONFIG, EXPECTED_DIMS)
+
+            logger.info("=== Agreement Scores ===")
+            logger.info("\n%s", df_agreement.round(4).to_string())
+            logger.info("=== Pair Counts ===")
+            logger.info("\n%s", df_pairs.to_string())
+
+            # ============================================
+            # Save Outputs
+            # ============================================
+            os.makedirs(args.agreement_scores, exist_ok=True)
+            os.makedirs(args.pair_counts, exist_ok=True)
+
+            agreement_path = os.path.join(args.agreement_scores, "agreement_scores.csv")
+            pairs_path     = os.path.join(args.pair_counts, "pair_counts.csv")
+
+            df_agreement.round(6).to_csv(agreement_path)
+            df_pairs.to_csv(pairs_path)
+
+            logger.info("Saved agreement scores → %s", agreement_path)
+            logger.info("Saved pair counts      → %s", pairs_path)
+
+            # Write metadata
+            with open(args.agreement_scores + ".meta.json", "w") as f:
+                json.dump({"path": agreement_path, "markets": len(df_agreement), "fields": len(df_agreement.columns)}, f, indent=2)
+            with open(args.pair_counts + ".meta.json", "w") as f:
+                json.dump({"path": pairs_path, "markets": len(df_pairs), "fields": len(df_pairs.columns)}, f, indent=2)
+
+        except Exception as e:
+            logger.exception("Fatal error: %s", str(e))
+            sys.exit(1)
+
+    args:
+      - --embedding
+      - {inputPath: embedding}
+      - --agreement_scores
+      - {outputPath: agreement_scores}
+      - --pair_counts
+      - {outputPath: pair_counts}
