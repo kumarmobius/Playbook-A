@@ -1,6 +1,6 @@
-name: Embedding Downloader
+name: Data downlaoder Cdn
 inputs:
-  - {name: embedding_cdn, type: String, optional: false}
+  - {name: data_file_cdn, type: String, optional: false}
 
 outputs:
   - {name: embedding, type: Data}
@@ -13,7 +13,7 @@ implementation:
       - -u
       - -c
       - |
-        import argparse, os, sys, json, logging
+        import argparse, os, sys, logging
         import requests
         from requests.adapters import HTTPAdapter
         try:
@@ -22,52 +22,43 @@ implementation:
             from urllib3 import Retry
 
         parser = argparse.ArgumentParser()
-        parser.add_argument('--embedding_cdn', required=True)
+        parser.add_argument('--data_file_cdn', required=True)
         parser.add_argument('--embedding', required=True)
         args = parser.parse_args()
 
         logging.basicConfig(stream=sys.stdout, level=logging.INFO)
         logger = logging.getLogger("embedding_downloader")
 
-        # Setup session with retry logic
         session = requests.Session()
         retry = Retry(total=5, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
         session.mount("http://", HTTPAdapter(max_retries=retry))
         session.mount("https://", HTTPAdapter(max_retries=retry))
 
         try:
-            # Download embedding.json
-            logger.info("Downloading embedding from: %s", args.embedding_cdn)
-            r = session.get(args.embedding_cdn, timeout=60, stream=True)
+            # Extract filename from URL
+            file_name = args.data_file_cdn.split("?")[0].rstrip("/").split("/")[-1]
+            logger.info("Downloading from: %s", args.data_file_cdn)
+            logger.info("Saving as: %s", file_name)
+
+            r = session.get(args.data_file_cdn, timeout=60, stream=True)
             r.raise_for_status()
 
-            # Save to output path
             os.makedirs(args.embedding, exist_ok=True)
-            save_path = os.path.join(args.embedding, "embedding.json")
+            save_path = os.path.join(args.embedding, file_name)
 
             with open(save_path, "wb") as f:
                 for chunk in r.iter_content(chunk_size=8192):
                     if chunk:
                         f.write(chunk)
 
-            logger.info("Successfully saved embedding to: %s", save_path)
-
-            # Write metadata
-            with open(args.embedding + ".meta.json", "w") as f:
-                json.dump({
-                    "embedding_path": save_path,
-                    "source_url": args.embedding_cdn,
-                    "file_size_bytes": os.path.getsize(save_path)
-                }, f, indent=2)
-
-            logger.info("Metadata saved.")
+            logger.info("Successfully saved to: %s", save_path)
 
         except Exception as e:
             logger.exception("Fatal error: %s", str(e))
             sys.exit(1)
 
     args:
-      - --embedding_cdn
-      - {inputValue: embedding_cdn}
+      - --data_file_cdn
+      - {inputValue: data_file_cdn}
       - --embedding
       - {outputPath: embedding}
