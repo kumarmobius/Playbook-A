@@ -1,6 +1,8 @@
 name: Data downlaoder CDN
 inputs:
   - {name: data_file_cdn, type: String, optional: false}
+  - {name: file_name, type: String, optional: true, default: ""}
+
 outputs:
   - {name: DataFile, type: Data}
 
@@ -22,11 +24,12 @@ implementation:
 
         parser = argparse.ArgumentParser()
         parser.add_argument('--data_file_cdn', required=True)
+        parser.add_argument('--file_name', default="")
         parser.add_argument('--DataFile', required=True)
         args = parser.parse_args()
 
         logging.basicConfig(stream=sys.stdout, level=logging.INFO)
-        logger = logging.getLogger("embedding_downloader")
+        logger = logging.getLogger("data_downloader")
 
         session = requests.Session()
         retry = Retry(total=5, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
@@ -34,16 +37,20 @@ implementation:
         session.mount("https://", HTTPAdapter(max_retries=retry))
 
         try:
-            # Extract filename from URL
-            file_name = args.data_file_cdn.split("?")[0].rstrip("/").split("/")[-1]
+            # Use provided file_name or extract from URL
+            if args.file_name.strip():
+                file_name = args.file_name.strip()
+            else:
+                file_name = args.data_file_cdn.split("?")[0].rstrip("/").split("/")[-1]
+
             logger.info("Downloading from: %s", args.data_file_cdn)
             logger.info("Saving as: %s", file_name)
 
             r = session.get(args.data_file_cdn, timeout=60, stream=True)
             r.raise_for_status()
 
-            os.makedirs(args.embedding, exist_ok=True)
-            save_path = os.path.join(args.embedding, file_name)
+            os.makedirs(args.DataFile, exist_ok=True)
+            save_path = os.path.join(args.DataFile, file_name)
 
             with open(save_path, "wb") as f:
                 for chunk in r.iter_content(chunk_size=8192):
@@ -59,5 +66,7 @@ implementation:
     args:
       - --data_file_cdn
       - {inputValue: data_file_cdn}
-      - --embedding
+      - --file_name
+      - {inputValue: file_name}
+      - --DataFile
       - {outputPath: DataFile}
