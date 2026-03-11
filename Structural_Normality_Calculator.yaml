@@ -1,0 +1,183 @@
+name: Structural Normality Calculator V1
+inputs:
+  - {name: e_m, type: Data, description: "e_m JSON file (market -> vector)"}
+  - {name: regime_dims, type: Data, description: "regime_dims JSON file (regime -> [start, end])"}
+
+outputs:
+  - {name: structural_normality, type: Data, description: "Structural normality scores CSV"}
+  - {name: error_fractions, type: Data, description: "Error fractions CSV"}
+
+implementation:
+  container:
+    image: gurpreetgandhi/nesy-factory:v1
+    command:
+      - python3
+      - -u
+      - -c
+      - |
+        import argparse, os, sys, json, logging
+        import numpy as np
+        import pandas as pd
+
+        parser = argparse.ArgumentParser()
+        parser.add_argument('--e_m', required=True)
+        parser.add_argument('--regime_dims', required=True)
+        parser.add_argument('--structural_normality', required=True)
+        parser.add_argument('--error_fractions', required=True)
+        args = parser.parse_args()
+
+        logging.basicConfig(stream=sys.stdout, level=logging.INFO)
+        logger = logging.getLogger("structural_normality_calculator")
+
+        # ============================================
+        # Field -> Regime Map
+        # ============================================
+        FIELD_REGIME_MAP = {
+            'PESTLE_P':        'political',
+            'PESTLE_E':        'measurement',
+            'PESTLE_S':        'operational',
+            'PESTLE_T':        'techprod',
+            'PESTLE_L':        'regulatory',
+            'PESTLE_Env':      'narrative',
+            '5F_Supplier':     'coordination',
+            '5F_Buyer':        'coordination',
+            '5F_NewEntrant':   'regulatory',
+            '5F_Substitute':   'techprod',
+            '5F_Rivalry':      'coordination',
+            'Contractibility': 'regulatory',
+            'DataExhaust':     'techprod',
+            'StdGap':          'techprod',
+        }
+
+        # ============================================
+        # Core Logic
+        # ============================================
+        def find_file_in_dir(directory):
+            for root, dirs, files in os.walk(directory):
+                files = [f for f in files if not f.endswith(".meta.json")]
+                if files:
+                    found = os.path.join(root, files[0])
+                    logger.info("Found file: %s", found)
+                    return found
+            raise FileNotFoundError(f"No file found in directory: {directory}")
+
+        def load_e_m(path: str) -> dict:
+            with open(path, 'r') as f:
+                raw = json.load(f)
+            return {market: np.array(vec, dtype=np.float32) for market, vec in raw.items()}
+
+        def load_regime_dims(path: str) -> dict:
+            with open(path, 'r') as f:
+                return json.load(f)
+
+        def validate_e_m(e_m: np.ndarray, regime_dims: dict) -> None:
+            if not np.isfinite(e_m).all():
+                raise ValueError("Non-finite values in e_m")
+            total_dim = e_m.shape[0]
+            for regime, (start, end) in regime_dims.items():
+                if end > total_dim:
+                    raise ValueError(f"Regime '{regime}' end={end} exceeds e_m dim={total_dim}")
+
+        def compute_normality_scores(e_m: np.ndarray, regime_dims: dict, field_regime: dict) -> dict:
+            validate_e_m(e_m, regime_dims)
+            total_norm = np.linalg.norm(e_m)
+            if total_norm == 0:
+                return {
+                    field: {'error_fraction': np.nan, 'structural_normality': np.nan, 'regime': regime}
+                    for field, regime in field_regime.items()
+                }
+            results = {}
+            for field, regime in field_regime.items():
+                if regime not in regime_dims:
+                    results[field] = {'error_fraction': np.nan, 'structural_normality': np.nan, 'regime': regime}
+                    continue
+                start, end = regime_dims[regime]
+                sub_norm   = float(np.linalg.norm(e_m[start:end]))
+                fraction   = sub_norm / float(total_norm)
+                normality  = float(np.clip(1.0 - fraction, 0.0, 1.0))
+                results[field] = {
+                    'error_fraction':       round(fraction,  6),
+                    'structural_normality': round(normality, 6),
+                    'regime':               regime,
+                }
+            return results
+
+        def build_normality_dataframes(e_m_dict: dict, regime_dims: dict, field_regime: dict):
+            normality_rows, fraction_rows = [], []
+            for market, e_m in e_m_dict.items():
+                scores = compute_normality_scores(e_m, regime_dims, field_regime)
+                normality_row = {'Market': market}
+                fraction_row  = {'Market': market}
+                for field, vals in scores.items():
+                    normality_row[field] = vals['structural_normality']
+                    fraction_row[field]  = vals['error_fraction']
+                normality_rows.append(normality_row)
+                fraction_rows.append(fraction_row)
+            df_normality = pd.DataFrame(normality_rows).set_index('Market')
+            df_fraction  = pd.DataFrame(fraction_rows).set_index('Market')
+            return df_normality, df_fraction
+
+        try:
+            # ============================================
+            # Load Inputs
+            # ============================================
+            e_m_file         = find_file_in_dir(args.e_m)
+            regime_dims_file = find_file_in_dir(args.regime_dims)
+
+            logger.info("Loading e_m from: %s", e_m_file)
+            e_m_dict = load_e_m(e_m_file)
+            logger.info("Loaded e_m for %d markets, dim=%d", len(e_m_dict), next(iter(e_m_dict.values())).shape[0])
+
+            logger.info("Loading regime_dims from: %s", regime_dims_file)
+            regime_dims = load_regime_dims(regime_dims_file)
+            logger.info("Loaded %d regime dim blocks", len(regime_dims))
+
+            # ============================================
+            # Compute
+            # ============================================
+            df_normality, df_fraction = build_normality_dataframes(e_m_dict, regime_dims, FIELD_REGIME_MAP)
+
+            logger.info("=== Structural Normality ===")
+            logger.info("%s", df_normality.round(4).to_string())
+            logger.info("=== Error Fractions ===")
+            logger.info("%s", df_fraction.round(4).to_string())
+
+            # Bounds check
+            assert (df_normality.dropna() >= 0).all().all(), "Normality below 0"
+            assert (df_normality.dropna() <= 1).all().all(), "Normality above 1"
+            logger.info("Bounds check [0,1]: passed")
+
+            # ============================================
+            # Save Outputs
+            # ============================================
+            os.makedirs(args.structural_normality, exist_ok=True)
+            os.makedirs(args.error_fractions, exist_ok=True)
+
+            normality_path = os.path.join(args.structural_normality, "structural_normality.csv")
+            fraction_path  = os.path.join(args.error_fractions, "error_fractions.csv")
+
+            df_normality.round(6).to_csv(normality_path)
+            df_fraction.round(6).to_csv(fraction_path)
+
+            logger.info("Saved structural normality → %s", normality_path)
+            logger.info("Saved error fractions      → %s", fraction_path)
+
+            # Write metadata
+            with open(args.structural_normality + ".meta.json", "w") as f:
+                json.dump({"path": normality_path, "markets": len(df_normality), "fields": len(df_normality.columns)}, f, indent=2)
+            with open(args.error_fractions + ".meta.json", "w") as f:
+                json.dump({"path": fraction_path, "markets": len(df_fraction), "fields": len(df_fraction.columns)}, f, indent=2)
+
+        except Exception as e:
+            logger.exception("Fatal error: %s", str(e))
+            sys.exit(1)
+
+    args:
+      - --e_m
+      - {inputPath: e_m}
+      - --regime_dims
+      - {inputPath: regime_dims}
+      - --structural_normality
+      - {outputPath: structural_normality}
+      - --error_fractions
+      - {outputPath: error_fractions}
