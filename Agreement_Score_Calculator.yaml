@@ -1,4 +1,4 @@
-name: Embedding Agreement Score Calculator
+name: Embedding Agreement Score Calculator.
 inputs:
   - {name: embedding, type: Data}
 
@@ -137,9 +137,9 @@ implementation:
             df_agreement, df_pairs = build_dataframes(all_embeddings, FIELD_CONFIG, EXPECTED_DIMS)
 
             logger.info("=== Agreement Scores ===")
-            logger.info("\n%s", df_agreement.round(4).to_string())
+            logger.info("%s", df_agreement.round(4).to_string())
             logger.info("=== Pair Counts ===")
-            logger.info("\n%s", df_pairs.to_string())
+            logger.info("%s", df_pairs.to_string())
 
             # ============================================
             # Save Outputs
