@@ -1,9 +1,8 @@
-name: Data downlaoder Cdn
+name: Data downlaoder CDN
 inputs:
   - {name: data_file_cdn, type: String, optional: false}
-
 outputs:
-  - {name: embedding, type: Data}
+  - {name: DataFile, type: Data}
 
 implementation:
   container:
@@ -23,7 +22,7 @@ implementation:
 
         parser = argparse.ArgumentParser()
         parser.add_argument('--data_file_cdn', required=True)
-        parser.add_argument('--embedding', required=True)
+        parser.add_argument('--DataFile', required=True)
         args = parser.parse_args()
 
         logging.basicConfig(stream=sys.stdout, level=logging.INFO)
@@ -61,4 +60,4 @@ implementation:
       - --data_file_cdn
       - {inputValue: data_file_cdn}
       - --embedding
-      - {outputPath: embedding}
+      - {outputPath: DataFile}
