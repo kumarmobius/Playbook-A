@@ -1,4 +1,5 @@
 name: Embedding Agreement Score Calculator.
+description: Embedding Agreement Score Calculator.
 inputs:
   - {name: embedding, type: Data}
 
