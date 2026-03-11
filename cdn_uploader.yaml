@@ -1,0 +1,144 @@
+name: Embedding CDN Uploader
+inputs:
+  - {name: embedding, type: Data, description: "Embedding JSON file to upload"}
+  - {name: bearer_token, type: String, description: "Path to a file containing bearer token (will be read)"}
+  - {name: domain, type: String, description: "Domain root for upload endpoint, e.g. https://api.example.com"}
+  - {name: get_cdn, type: String, description: "CDN base URL to prefix returned relative cdnUrl"}
+
+outputs:
+  - {name: embedding_cdn, type: String, description: "CDN URL of the uploaded embedding JSON"}
+
+implementation:
+  container:
+    image: gurpreetgandhi/nesy-factory:vtest4
+    command:
+      - python3
+      - -u
+      - -c
+      - |
+        import argparse, subprocess, json, os, tempfile, shutil, sys, traceback
+
+        parser = argparse.ArgumentParser()
+        parser.add_argument('--embedding', type=str, required=True)
+        parser.add_argument('--bearer_token', type=str, required=True)
+        parser.add_argument('--domain', type=str, required=True)
+        parser.add_argument('--get_cdn', type=str, required=True)
+        parser.add_argument('--embedding_cdn', type=str, required=True)
+        args = parser.parse_args()
+
+        def ensure_parent_dir(path):
+            parent = os.path.dirname(path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+
+        def atomic_write(path, text):
+            ensure_parent_dir(path)
+            fd, tmp = tempfile.mkstemp(prefix="tmp_cdn_")
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    f.write(text)
+                os.replace(tmp, path)
+            except Exception:
+                try:
+                    os.remove(tmp)
+                except Exception:
+                    pass
+                raise
+
+        def encode_special_chars(text):
+            return (
+                text.replace("$", "%24")
+                    .replace("(", "%28")
+                    .replace(")", "%29")
+                    .replace("[", "%5B")
+                    .replace("]", "%5D")
+                    .replace("{", "%7B")
+                    .replace("}", "%7D")
+            )
+
+        with open(args.bearer_token, "r", encoding="utf-8") as f:
+            bearer_token = f.read().strip()
+
+        upload_url = (
+            f"{args.domain.rstrip('/')}"
+            "/mobius-content-service/v1.0/content/upload"
+            "?filePathAccess=private&filePath=%2Fbottle%2Flimka%2Fsoda%2F"
+        )
+
+        def run_upload(path):
+            cmd = [
+                "curl",
+                "--location", upload_url,
+                "--header", f"Authorization: Bearer {bearer_token}",
+                "--form", f"file=@{path}",
+                "--fail",
+                "--show-error"
+            ]
+            p = subprocess.run(cmd, capture_output=True)
+            if p.returncode != 0:
+                raise RuntimeError(p.stderr.decode())
+            return json.loads(p.stdout.decode())
+
+        def prepare_file(path):
+            if not os.path.exists(path):
+                raise FileNotFoundError(path)
+            if os.path.isfile(path):
+                name = os.path.basename(path)
+                safe = encode_special_chars(name)
+                if safe != name:
+                    tmp = os.path.join(tempfile.gettempdir(), safe)
+                    shutil.copy2(path, tmp)
+                    return tmp, tmp
+                return path, None
+            # If directory, zip it
+            import uuid
+            safe = encode_special_chars(os.path.basename(path))
+            zip_path = os.path.join(tempfile.gettempdir(), f"{safe}_{uuid.uuid4().hex}.zip")
+            shutil.make_archive(zip_path[:-4], "zip", path)
+            return zip_path, zip_path
+
+        tmp_files = []
+
+        try:
+            # Locate embedding.json inside the Data directory
+            embedding_file = os.path.join(args.embedding, "embedding.json")
+            if not os.path.exists(embedding_file):
+                raise FileNotFoundError(f"embedding.json not found at: {embedding_file}")
+
+            prepared, tmp = prepare_file(embedding_file)
+            if tmp:
+                tmp_files.append(tmp)
+
+            resp = run_upload(prepared)
+            rel = resp.get("cdnUrl")
+            if not rel:
+                raise ValueError("cdnUrl missing in upload response")
+
+            full_url = encode_special_chars(f"{args.get_cdn.rstrip('/')}{rel}")
+
+            atomic_write(args.embedding_cdn, full_url)
+
+            print("[INFO] Upload complete")
+            print("[CDN] Embedding:", full_url)
+
+        except Exception:
+            traceback.print_exc()
+            sys.exit(1)
+        finally:
+            for f in tmp_files:
+                try:
+                    os.remove(f)
+                except Exception:
+                    pass
+
+    args:
+      - --embedding
+      - {inputPath: embedding}
+      - --bearer_token
+      - {inputPath: bearer_token}
+      - --domain
+      - {inputValue: domain}
+      - --get_cdn
+      - {inputValue: get_cdn}
+      - --embedding_cdn
+      - {outputPath: embedding_cdn}
