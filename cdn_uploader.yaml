@@ -1,13 +1,12 @@
-name: Embedding CDN Uploader.
-description: CDN Uploader
+name: Embedding CDN Uploader V1
 inputs:
-  - {name: embedding, type: Data, description: "Embedding JSON file to upload"}
+  - {name: embedding, type: Data, description: "Data directory to upload"}
   - {name: bearer_token, type: string, description: "Path to a file containing bearer token (will be read)"}
   - {name: domain, type: String, description: "Domain root for upload endpoint, e.g. https://api.example.com"}
   - {name: get_cdn, type: String, description: "CDN base URL to prefix returned relative cdnUrl"}
 
 outputs:
-  - {name: embedding_cdn, type: String, description: "CDN URL of the uploaded embedding JSON"}
+  - {name: embedding_cdn, type: String, description: "CDN URL of the uploaded file"}
 
 implementation:
   container:
@@ -17,7 +16,7 @@ implementation:
       - -u
       - -c
       - |
-        import argparse, subprocess, json, os, tempfile, shutil, sys, traceback
+        import argparse, subprocess, json, os, tempfile, shutil, sys, traceback, uuid
 
         parser = argparse.ArgumentParser()
         parser.add_argument('--embedding', type=str, required=True)
@@ -80,6 +79,28 @@ implementation:
                 raise RuntimeError(p.stderr.decode())
             return json.loads(p.stdout.decode())
 
+        def encode_special_chars(text):
+            return (
+                text.replace("$", "%24")
+                    .replace("(", "%28")
+                    .replace(")", "%29")
+                    .replace("[", "%5B")
+                    .replace("]", "%5D")
+                    .replace("{", "%7B")
+                    .replace("}", "%7D")
+            )
+
+        def find_file_in_dir(directory):
+            print(f"[INFO] Scanning directory: {directory}")
+            for root, dirs, files in os.walk(directory):
+                # Skip meta files
+                files = [f for f in files if not f.endswith(".meta.json")]
+                if files:
+                    found = os.path.join(root, files[0])
+                    print(f"[INFO] Found file: {found}")
+                    return found
+            raise FileNotFoundError(f"No file found in directory: {directory}")
+
         def prepare_file(path):
             if not os.path.exists(path):
                 raise FileNotFoundError(path)
@@ -92,7 +113,6 @@ implementation:
                     return tmp, tmp
                 return path, None
             # If directory, zip it
-            import uuid
             safe = encode_special_chars(os.path.basename(path))
             zip_path = os.path.join(tempfile.gettempdir(), f"{safe}_{uuid.uuid4().hex}.zip")
             shutil.make_archive(zip_path[:-4], "zip", path)
@@ -101,12 +121,10 @@ implementation:
         tmp_files = []
 
         try:
-            # Locate embedding.json inside the Data directory
-            embedding_file = os.path.join(args.embedding, "embedding.json")
-            if not os.path.exists(embedding_file):
-                raise FileNotFoundError(f"embedding.json not found at: {embedding_file}")
+            # Auto-discover the file inside the Data directory
+            target_file = find_file_in_dir(args.embedding)
 
-            prepared, tmp = prepare_file(embedding_file)
+            prepared, tmp = prepare_file(target_file)
             if tmp:
                 tmp_files.append(tmp)
 
@@ -120,7 +138,7 @@ implementation:
             atomic_write(args.embedding_cdn, full_url)
 
             print("[INFO] Upload complete")
-            print("[CDN] Embedding:", full_url)
+            print("[CDN] URL:", full_url)
 
         except Exception:
             traceback.print_exc()
