@@ -1,4 +1,5 @@
-name: Embedding CDN Uploader V1
+name: FIle CDN Uploader V1
+description: CDN UPloader
 inputs:
   - {name: embedding, type: Data, description: "Data directory to upload"}
   - {name: bearer_token, type: string, description: "Path to a file containing bearer token (will be read)"}
