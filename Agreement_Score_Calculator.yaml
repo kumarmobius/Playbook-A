@@ -1,11 +1,16 @@
-name: Embedding Agreement Score Calculator.
-description: Embedding Agreement Score Calculator.
+name: Agreement Score Calculator V1
+description: Computes embedding-based agreement scores for each market using cosine   similarity across regime vectors. Supports output of latest-year scores
+  or all-years scores. FIELD_CONFIG and SUB_REGIME_SLICES are hardcoded.
+  REGIME_DIM is configurable (default 32).
 inputs:
-  - {name: embedding, type: Data}
+  - {name: embeddings,     type: Data,    description: "Path to mock_embeddings.csv"}
+  - {name: regime_dim,     type: Integer, default: "32",          description: "Dimensionality of each regime embedding vector"}
+  - {name: output_mode,    type: String,  default: "latest",    description: "Output mode: 'latest' for latest year only, 'all' for all years"}
+  - {name: round_decimals, type: Integer, default: "6",           description: "Decimal places to round agreement scores"}
 
 outputs:
-  - {name: agreement_scores, type: Data}
-  - {name: pair_counts, type: Data}
+  - {name: agreement_scores, type: Data, description: "agreement_scores.csv (latest year, indexed by market)"}
+  - {name: agreement_scores_all_years, type: Data, description: "agreement_scores_all_years.csv (all years, no index)"}
 
 implementation:
   container:
@@ -20,157 +25,199 @@ implementation:
         import pandas as pd
 
         parser = argparse.ArgumentParser()
-        parser.add_argument('--embedding', required=True)
-        parser.add_argument('--agreement_scores', required=True)
-        parser.add_argument('--pair_counts', required=True)
+        parser.add_argument('--embeddings',                  required=True)
+        parser.add_argument('--regime_dim',                  type=int,   default=32)
+        parser.add_argument('--output_mode',                 type=str,   default='latest',
+                            choices=['latest', 'all'],
+                            help="'latest' = latest year per market; 'all' = every year")
+        parser.add_argument('--round_decimals',              type=int,   default=6)
+        parser.add_argument('--agreement_scores',            required=True)
+        parser.add_argument('--agreement_scores_all_years',  required=True)
         args = parser.parse_args()
 
         logging.basicConfig(stream=sys.stdout, level=logging.INFO)
-        logger = logging.getLogger("embedding_agreement_calculator")
+        logger = logging.getLogger("agreement_score_calculator")
 
-        # ============================================
-        # Field Config & Expected Dims
-        # ============================================
+        REGIME_DIM = args.regime_dim
+
+        # ============================================================
+        # Hardcoded: SUB_REGIME_SLICES
+        # ============================================================
+        SUB_REGIME_SLICES = {
+            "supply_dims":  ("coordination", 0,  11),
+            "buyer_dims":   ("coordination", 11, 21),
+            "rivalry_dims": ("coordination", 21, 32),
+            "entry_dims":   ("regulatory",   0,  11),
+            "sub_dims":     ("techprod",     0,  11),
+            "env_dims":     ("narrative",    0,  11),
+        }
+
+        # ============================================================
+        # Hardcoded: FIELD_CONFIG
+        # (target_regime, [comparison_regimes], inverted)
+        # ============================================================
         FIELD_CONFIG = {
-            'PESTLE_P':        ('Political Power',           ['Measurement & Statistical', 'Economic Coordination', 'Operational Reality', 'Regulatory & Enforcement'], False),
-            'PESTLE_E':        ('Measurement & Statistical', ['Economic Coordination', 'Operational Reality', 'Technological Production'],                              False),
-            'PESTLE_S':        ('Operational Reality',       ['Measurement & Statistical', 'Narrative & Legitimacy', 'Economic Coordination'],                          False),
-            'PESTLE_T':        ('Technological Production',  ['Measurement & Statistical', 'Economic Coordination', 'Operational Reality'],                              False),
-            'PESTLE_L':        ('Regulatory & Enforcement',  ['Political Power', 'Economic Coordination', 'Operational Reality'],                                       False),
-            'PESTLE_Env':      ('Narrative & Legitimacy',    ['Measurement & Statistical', 'Regulatory & Enforcement'],                                                 False),
-            '5F_Supplier':     ('Economic Coordination',     ['Regulatory & Enforcement', 'Incentive & Rent'],                                                          False),
-            '5F_Buyer':        ('Economic Coordination',     ['Operational Reality', 'Incentive & Rent'],                                                               False),
-            '5F_NewEntrant':   ('Regulatory & Enforcement',  ['Political Power', 'Economic Coordination', 'Technological Production'],                                  False),
-            '5F_Substitute':   ('Technological Production',  ['Economic Coordination', 'Operational Reality'],                                                          False),
-            '5F_Rivalry':      ('Economic Coordination',     ['Incentive & Rent', 'Regulatory & Enforcement'],                                                          False),
-            'Contractibility': ('Regulatory & Enforcement',  ['Operational Reality', 'Economic Coordination'],                                                          False),
-            'DataExhaust':     ('Technological Production',  ['Operational Reality', 'Economic Coordination'],                                                          False),
-            'StdGap':          ('Technological Production',  ['Regulatory & Enforcement'],                                                                              True),
+            "PESTLE_P":        ("political",    ["measurement", "coordination", "operational", "regulatory"], False),
+            "PESTLE_E":        ("measurement",  ["coordination", "operational", "techprod"],                  False),
+            "PESTLE_S":        ("operational",  ["measurement",  "narrative",   "coordination"],              False),
+            "PESTLE_T":        ("techprod",     ["measurement",  "coordination","operational"],               False),
+            "PESTLE_L":        ("regulatory",   ["political",    "coordination","operational"],               False),
+            "PESTLE_Env":      ("env_dims",     ["measurement",  "regulatory"],                               False),
+            "5F_Supplier":     ("supply_dims",  ["regulatory",   "incentive"],                                False),
+            "5F_Buyer":        ("buyer_dims",   ["operational",  "incentive"],                                False),
+            "5F_NewEntrant":   ("entry_dims",   ["political",    "coordination","techprod"],                  False),
+            "5F_Substitute":   ("sub_dims",     ["coordination", "operational"],                              False),
+            "5F_Rivalry":      ("rivalry_dims", ["incentive",    "regulatory"],                               False),
+            "Contractibility": ("regulatory",   ["operational",  "coordination"],                             False),
+            "DataExhaust":     ("techprod",     ["operational",  "coordination"],                             False),
+            "StdGap":          ("techprod",     ["regulatory"],                                               True),
         }
 
-        EXPECTED_DIMS = {
-            'Political Power':           None,
-            'Measurement & Statistical': None,
-            'Economic Coordination':     None,
-            'Regulatory & Enforcement':  None,
-            'Technological Production':  None,
-            'Operational Reality':       None,
-            'Narrative & Legitimacy':    None,
-            'Incentive & Rent':          None,
-            'Temporal & Shock':          None,
-        }
+        # ============================================================
+        # Vector Helpers
+        # ============================================================
+        def get_base_vec(row, regime):
+            cols = [f"{regime}__{i}" for i in range(REGIME_DIM)]
+            if not all(c in row for c in cols):
+                return None
+            return np.array([float(row[c]) for c in cols], dtype=np.float32)
 
-        # ============================================
-        # Core Logic
-        # ============================================
-        def load_embeddings(path: str) -> dict:
-            with open(path, 'r') as f:
-                raw = json.load(f)
-            return {
-                market: {regime: np.array(vec, dtype=np.float32) for regime, vec in regimes.items()}
-                for market, regimes in raw.items()
-            }
+        def get_regime_vec(row, key):
+            if key in SUB_REGIME_SLICES:
+                parent, s, e = SUB_REGIME_SLICES[key]
+                parent_vec = get_base_vec(row, parent)
+                return parent_vec[s:e] if parent_vec is not None else None
+            return get_base_vec(row, key)
 
-        def validate_embeddings(regime_embeds: dict, expected_dims: dict) -> None:
-            for regime, vec in regime_embeds.items():
-                if expected_dims and expected_dims.get(regime) is not None:
-                    if vec.shape[0] != expected_dims[regime]:
-                        raise ValueError(f"Regime '{regime}': got dim={vec.shape[0]}, expected {expected_dims[regime]}")
-                if not np.isfinite(vec).all():
-                    raise ValueError(f"Non-finite values in regime '{regime}'")
-
-        def safe_cosine(a: np.ndarray, b: np.ndarray) -> float:
-            na, nb = np.linalg.norm(a), np.linalg.norm(b)
+        def safe_cosine(a, b, target_dim):
+            if a is None or b is None:
+                return np.nan
+            b_t = b[:target_dim] if len(b) > target_dim else b
+            a_t = a[:target_dim] if len(a) > target_dim else a
+            if len(a_t) != len(b_t):
+                return np.nan
+            na, nb = np.linalg.norm(a_t), np.linalg.norm(b_t)
             if na == 0 or nb == 0 or not np.isfinite(na) or not np.isfinite(nb):
                 return np.nan
-            return float(np.dot(a, b) / (na * nb))
+            return float(np.dot(a_t, b_t) / (na * nb))
 
-        def compute_agreement_scores(regime_embeds: dict, field_config: dict, expected_dims: dict) -> dict:
-            validate_embeddings(regime_embeds, expected_dims)
+        # ============================================================
+        # Agreement Score Computation
+        # ============================================================
+        def compute_agreement_row(row):
             results = {}
-            for field, (target, others, inverted) in field_config.items():
-                if target not in regime_embeds:
-                    results[field] = {'agreement': np.nan, 'n_pairs': 0, 'inverted': inverted}
+            for field, (target, others, inverted) in FIELD_CONFIG.items():
+                tgt = get_regime_vec(row, target)
+                if tgt is None:
+                    results[field] = np.nan
                     continue
-                tgt  = regime_embeds[target]
-                sims = [safe_cosine(tgt, regime_embeds[o]) for o in others if o in regime_embeds]
+                target_dim = len(tgt)
+                sims = [safe_cosine(tgt, get_regime_vec(row, o), target_dim) for o in others]
                 sims = [s for s in sims if not np.isnan(s)]
                 if sims:
                     raw = float(np.mean(sims))
-                    results[field] = {
-                        'agreement': (1.0 - raw) if inverted else raw,
-                        'n_pairs':   len(sims),
-                        'inverted':  inverted,
-                    }
+                    results[field] = round((1.0 - raw) if inverted else raw, args.round_decimals)
                 else:
-                    results[field] = {'agreement': np.nan, 'n_pairs': 0, 'inverted': inverted}
+                    results[field] = np.nan
             return results
 
-        def build_dataframes(all_embeddings: dict, field_config: dict, expected_dims: dict):
-            agreement_rows, pairs_rows = [], []
-            for market, regime_embeds in all_embeddings.items():
-                scores = compute_agreement_scores(regime_embeds, field_config, expected_dims)
-                agreement_row = {'Market': market}
-                pairs_row     = {'Market': market}
-                for field, vals in scores.items():
-                    agreement_row[field]          = vals['agreement']
-                    pairs_row[f'{field}_n_pairs'] = vals['n_pairs']
-                agreement_rows.append(agreement_row)
-                pairs_rows.append(pairs_row)
-            df_agreement = pd.DataFrame(agreement_rows).set_index('Market')
-            df_pairs     = pd.DataFrame(pairs_rows).set_index('Market')
-            return df_agreement, df_pairs
+        def compute_all(df):
+            records = []
+            for _, row in df.iterrows():
+                d      = row.to_dict()
+                scores = compute_agreement_row(d)
+                record = {"market": row["market"], "year": int(row["year"])}
+                record.update(scores)
+                records.append(record)
+            return pd.DataFrame(records)
 
+        def get_latest_year(df_all):
+            idx = df_all.groupby("market")["year"].idxmax()
+            return df_all.loc[idx].drop(columns=["year"]).set_index("market")
+
+        def report_nulls(df):
+            null_counts = df.isna().sum()
+            null_counts  = null_counts[null_counts > 0]
+            if not null_counts.empty:
+                logger.warning("Null agreement scores detected:")
+                for field, cnt in null_counts.items():
+                    markets = df[df[field].isna()].index.tolist()
+                    logger.warning("  %s (%d): %s", field, cnt, markets)
+            else:
+                logger.info("No null agreement scores found.")
+
+        # ============================================================
+        # Main
+        # ============================================================
         try:
-            # ============================================
-            # Load embedding.json from input Data path
-            # ============================================
-            embedding_path = os.path.join(args.embedding, "embedding.json")
-            logger.info("Loading embeddings from: %s", embedding_path)
+            csv_path = os.path.join(args.embeddings, "mock_embeddings.csv")
+            logger.info("Loading embeddings from: %s", csv_path)
+            df = pd.read_csv(csv_path)
+            logger.info("Loaded shape=%s  REGIME_DIM=%d  mode=%s",
+                        df.shape, REGIME_DIM, args.output_mode)
 
-            all_embeddings = load_embeddings(embedding_path)
-            logger.info("Loaded %d vectors across %d markets",
-                        sum(len(v) for v in all_embeddings.values()), len(all_embeddings))
+            df_all    = compute_all(df)
+            df_latest = get_latest_year(df_all)
 
-            # ============================================
-            # Compute Agreement Scores
-            # ============================================
-            df_agreement, df_pairs = build_dataframes(all_embeddings, FIELD_CONFIG, EXPECTED_DIMS)
+            logger.info("=== Agreement Scores (latest year) ===")
+            logger.info("%s", df_latest.round(4).to_string())
 
-            logger.info("=== Agreement Scores ===")
-            logger.info("%s", df_agreement.round(4).to_string())
-            logger.info("=== Pair Counts ===")
-            logger.info("%s", df_pairs.to_string())
+            report_nulls(df_latest)
 
-            # ============================================
-            # Save Outputs
-            # ============================================
-            os.makedirs(args.agreement_scores, exist_ok=True)
-            os.makedirs(args.pair_counts, exist_ok=True)
+            # ---- Save outputs ----
+            os.makedirs(args.agreement_scores,           exist_ok=True)
+            os.makedirs(args.agreement_scores_all_years, exist_ok=True)
 
-            agreement_path = os.path.join(args.agreement_scores, "agreement_scores.csv")
-            pairs_path     = os.path.join(args.pair_counts, "pair_counts.csv")
+            latest_path  = os.path.join(args.agreement_scores,           "agreement_scores.csv")
+            all_yrs_path = os.path.join(args.agreement_scores_all_years, "agreement_scores_all_years.csv")
 
-            df_agreement.round(6).to_csv(agreement_path)
-            df_pairs.to_csv(pairs_path)
+            if args.output_mode == "latest":
+                df_latest.round(args.round_decimals).to_csv(latest_path)
+                logger.info("Saved latest-year scores → %s", latest_path)
+                # Write empty placeholder for all-years output
+                pd.DataFrame().to_csv(all_yrs_path, index=False)
+                logger.info("output_mode=latest: skipped all-years output (empty placeholder written)")
 
-            logger.info("Saved agreement scores → %s", agreement_path)
-            logger.info("Saved pair counts      → %s", pairs_path)
+            elif args.output_mode == "all":
+                df_all.round(args.round_decimals).to_csv(all_yrs_path, index=False)
+                logger.info("Saved all-years scores → %s", all_yrs_path)
+                # Write empty placeholder for latest output
+                pd.DataFrame().to_csv(latest_path)
+                logger.info("output_mode=all: skipped latest-year output (empty placeholder written)")
 
-            # Write metadata
+            # ---- Write metadata ----
             with open(args.agreement_scores + ".meta.json", "w") as f:
-                json.dump({"path": agreement_path, "markets": len(df_agreement), "fields": len(df_agreement.columns)}, f, indent=2)
-            with open(args.pair_counts + ".meta.json", "w") as f:
-                json.dump({"path": pairs_path, "markets": len(df_pairs), "fields": len(df_pairs.columns)}, f, indent=2)
+                json.dump({
+                    "path":        latest_path,
+                    "output_mode": args.output_mode,
+                    "markets":     len(df_latest),
+                    "fields":      len(df_latest.columns),
+                    "regime_dim":  REGIME_DIM,
+                }, f, indent=2)
+
+            with open(args.agreement_scores_all_years + ".meta.json", "w") as f:
+                json.dump({
+                    "path":        all_yrs_path,
+                    "output_mode": args.output_mode,
+                    "rows":        len(df_all),
+                    "fields":      len(df_all.columns) - 2,
+                    "regime_dim":  REGIME_DIM,
+                }, f, indent=2)
 
         except Exception as e:
             logger.exception("Fatal error: %s", str(e))
             sys.exit(1)
 
     args:
-      - --embedding
-      - {inputPath: embedding}
+      - --embeddings
+      - {inputPath: embeddings}
+      - --regime_dim
+      - {inputValue: regime_dim}
+      - --output_mode
+      - {inputValue: output_mode}
+      - --round_decimals
+      - {inputValue: round_decimals}
       - --agreement_scores
       - {outputPath: agreement_scores}
-      - --pair_counts
-      - {outputPath: pair_counts}
+      - --agreement_scores_all_years
+      - {outputPath: agreement_scores_all_years}
