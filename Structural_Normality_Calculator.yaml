@@ -1,15 +1,12 @@
-name: Structural Normality Calculator
-description:   Computes structural normality scores (and optionally error fractions) for each
-  market × year using regime sub-vector norms from a flat e_m embedding vector.
-  Supports output of latest-year scores, all-years scores, or both.
-  REGIME_DIMS and FIELD_REGIME_MAP are hardcoded. Total vector size and
-  error-fraction output are configurable.
+name: Structural Normality Calculator V1
+description: Computes structural normality per market x year from e_m regime sub-vector norms. Outputs latest, all-years, or both. REGIME_DIMS and FIELD_REGIME_MAP hardcoded.
+
 inputs:
-  - {name: e_m_data,           type: Data,    description: "Path directory containing mock_e_m.csv"}
-  - {name: output_mode,        type: String,  default: "both",    description: "Output mode: 'latest' | 'all' | 'both'"}
-  - {name: total_vector_size,  type: Integer, default: "320",       description: "Total dimensionality of the e_m embedding vector (e_0 ... e_{N-1})"}
-  - {name: output_fractions,   type: String,  default: "false",   description: "Set 'true' to also save error_fraction CSVs alongside normality CSVs"}
-  - {name: round_decimals,     type: Integer, default: "6",         description: "Decimal places to round output scores"}
+  - {name: e_m_data,           type: Data,    description: "Input directory containing the e_m embeddings CSV file"}
+  - {name: output_mode,        type: String,  default: "both",  description: "Output mode: latest, all, or both"}
+  - {name: total_vector_size,  type: Integer, default: "320",   description: "Total dimensionality of the e_m embedding vector (e_0 to e_N-1)"}
+  - {name: output_fractions,   type: String,  default: "false", description: "Set true to also save error_fraction CSVs alongside normality CSVs"}
+  - {name: round_decimals,     type: Integer, default: "6",     description: "Decimal places to round output scores"}
 
 outputs:
   - {name: structural_normality,          type: Data, description: "structural_normality.csv — latest year per market (indexed by market)"}
@@ -113,33 +110,31 @@ implementation:
         # ================================================================
         # Core computation helpers
         # ================================================================
-        def compute_normality_for_row(e_m: np.ndarray) -> dict:
+        def _regime_fractions(e_m: np.ndarray) -> dict:
             total_norm = float(np.linalg.norm(e_m))
             if total_norm == 0 or not np.isfinite(total_norm):
                 return {f: np.nan for f in FIELDS}
+            return {
+                field: float(np.linalg.norm(e_m[REGIME_DIMS[rk][0]:REGIME_DIMS[rk][1]])) / total_norm
+                for field, rk in FIELD_REGIME_MAP.items()
+            }
 
-            results = {}
-            for field, regime_key in FIELD_REGIME_MAP.items():
-                start, end = REGIME_DIMS[regime_key]
-                sub_norm   = float(np.linalg.norm(e_m[start:end]))
-                fraction   = sub_norm / total_norm
-                normality  = float(np.clip(1.0 - fraction, 0.0, 1.0))
-                results[field] = round(normality, args.round_decimals)
-            return results
+        def compute_normality_for_row(e_m: np.ndarray) -> dict:
+            fracs = _regime_fractions(e_m)
+            return {f: round(float(np.clip(1.0 - v, 0.0, 1.0)), args.round_decimals) if not np.isnan(v) else np.nan for f, v in fracs.items()}
 
         def compute_fraction_for_row(e_m: np.ndarray) -> dict:
-            total_norm = float(np.linalg.norm(e_m))
-            if total_norm == 0 or not np.isfinite(total_norm):
-                return {f: np.nan for f in FIELDS}
+            fracs = _regime_fractions(e_m)
+            return {f: round(v, args.round_decimals) if not np.isnan(v) else np.nan for f, v in fracs.items()}
 
-            results = {}
-            for field, regime_key in FIELD_REGIME_MAP.items():
-                start, end = REGIME_DIMS[regime_key]
-                sub_norm   = float(np.linalg.norm(e_m[start:end]))
-                results[field] = round(sub_norm / total_norm, args.round_decimals)
-            return results
-
+        # ================================================================
+        # Process all rows
+        # ================================================================
         def compute_all_years(df: pd.DataFrame) -> tuple:
+            """
+            Returns (df_normality, df_fractions) — both market | year | fields.
+            df_fractions is None if EMIT_FRACTIONS is False.
+            """
             norm_records     = []
             fraction_records = [] if EMIT_FRACTIONS else None
 
@@ -184,8 +179,30 @@ implementation:
         # ================================================================
         # Main
         # ================================================================
+        def resolve_csv_path(input_dir: str) -> str:
+            candidates = [
+                os.path.join(input_dir, "mock_e_m.csv"),
+                os.path.join(input_dir, "mock_e_m"),
+            ]
+            for path in candidates:
+                if os.path.isfile(path):
+                    logger.info("Resolved input file: %s", path)
+                    return path
+            for fname in os.listdir(input_dir):
+                if fname.endswith(".csv"):
+                    path = os.path.join(input_dir, fname)
+                    logger.warning("Fallback CSV file used: %s", path)
+                    return path
+            all_files = [f for f in os.listdir(input_dir) if os.path.isfile(os.path.join(input_dir, f))]
+            if all_files:
+                path = os.path.join(input_dir, all_files[0])
+                logger.warning("Last-resort file used: %s", path)
+                return path
+            raise FileNotFoundError("No readable input file found in: %s  contents: %s" % (input_dir, os.listdir(input_dir)))
+
         try:
-            csv_path = os.path.join(args.e_m_data, "mock_e_m.csv")
+            logger.info("Scanning input dir: %s  contents=%s", args.e_m_data, os.listdir(args.e_m_data))
+            csv_path = resolve_csv_path(args.e_m_data)
             logger.info("Loading e_m embeddings from: %s", csv_path)
             df_raw = pd.read_csv(csv_path)
             assert "market" in df_raw.columns, "Missing 'market' column"
