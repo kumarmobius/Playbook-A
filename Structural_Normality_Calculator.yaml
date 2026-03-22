@@ -1,11 +1,19 @@
-name: Structural Normality Calculator V1
+name: Structural Normality Calculator
+description:   Computes structural normality scores (and optionally error fractions) for each
+  market × year using regime sub-vector norms from a flat e_m embedding vector.
+  Supports output of latest-year scores, all-years scores, or both.
+  REGIME_DIMS and FIELD_REGIME_MAP are hardcoded. Total vector size and
+  error-fraction output are configurable.
 inputs:
-  - {name: e_m, type: Data, description: "e_m JSON file (market -> vector)"}
-  - {name: regime_dims, type: Data, description: "regime_dims JSON file (regime -> [start, end])"}
+  - {name: e_m_data,           type: Data,    description: "Path directory containing mock_e_m.csv"}
+  - {name: output_mode,        type: String,  default: "both",    description: "Output mode: 'latest' | 'all' | 'both'"}
+  - {name: total_vector_size,  type: Integer, default: "320",       description: "Total dimensionality of the e_m embedding vector (e_0 ... e_{N-1})"}
+  - {name: output_fractions,   type: String,  default: "false",   description: "Set 'true' to also save error_fraction CSVs alongside normality CSVs"}
+  - {name: round_decimals,     type: Integer, default: "6",         description: "Decimal places to round output scores"}
 
 outputs:
-  - {name: structural_normality, type: Data, description: "Structural normality scores CSV"}
-  - {name: error_fractions, type: Data, description: "Error fractions CSV"}
+  - {name: structural_normality,          type: Data, description: "structural_normality.csv — latest year per market (indexed by market)"}
+  - {name: structural_normality_all_years, type: Data, description: "structural_normality_all_years.csv — all years (no index)"}
 
 implementation:
   container:
@@ -20,164 +28,263 @@ implementation:
         import pandas as pd
 
         parser = argparse.ArgumentParser()
-        parser.add_argument('--e_m', required=True)
-        parser.add_argument('--regime_dims', required=True)
-        parser.add_argument('--structural_normality', required=True)
-        parser.add_argument('--error_fractions', required=True)
+        parser.add_argument('--e_m_data',                         required=True)
+        parser.add_argument('--output_mode',                      type=str,  default='both',
+                            choices=['latest', 'all', 'both'])
+        parser.add_argument('--total_vector_size',                type=int,  default=320)
+        parser.add_argument('--output_fractions',                 type=str,  default='false',
+                            help="'true' to also emit error_fraction CSVs")
+        parser.add_argument('--round_decimals',                   type=int,  default=6)
+        parser.add_argument('--structural_normality',             required=True)
+        parser.add_argument('--structural_normality_all_years',   required=True)
         args = parser.parse_args()
 
         logging.basicConfig(stream=sys.stdout, level=logging.INFO)
         logger = logging.getLogger("structural_normality_calculator")
 
-        # ============================================
-        # Field -> Regime Map
-        # ============================================
-        FIELD_REGIME_MAP = {
-            'PESTLE_P':        'political',
-            'PESTLE_E':        'measurement',
-            'PESTLE_S':        'operational',
-            'PESTLE_T':        'techprod',
-            'PESTLE_L':        'regulatory',
-            'PESTLE_Env':      'narrative',
-            '5F_Supplier':     'coordination',
-            '5F_Buyer':        'coordination',
-            '5F_NewEntrant':   'regulatory',
-            '5F_Substitute':   'techprod',
-            '5F_Rivalry':      'coordination',
-            'Contractibility': 'regulatory',
-            'DataExhaust':     'techprod',
-            'StdGap':          'techprod',
+        EMIT_FRACTIONS    = args.output_fractions.strip().lower() == 'true'
+        TOTAL_VECTOR_SIZE = args.total_vector_size
+        E_COLS            = [f"e_{i}" for i in range(TOTAL_VECTOR_SIZE)]
+
+        # ================================================================
+        # Hardcoded: REGIME_DIMS
+        # Format: regime_key -> [start, end]  (end exclusive)
+        # ================================================================
+        REGIME_DIMS = {
+            # 9 full regime blocks (32 dims each)
+            "political":    [0,   32],
+            "measurement":  [32,  64],
+            "coordination": [64,  96],
+            "regulatory":   [96,  128],
+            "techprod":     [128, 160],
+            "operational":  [160, 192],
+            "narrative":    [192, 224],
+            "incentive":    [224, 256],
+            "temporal":     [256, 288],
+
+            # coordination sub-slices [64–96]
+            "supply_dims":  [64,  75],
+            "buyer_dims":   [75,  85],
+            "rivalry_dims": [85,  96],
+
+            # regulatory sub-slices [96–128]
+            "entry_dims":   [96,  107],
+            "enforce_dims": [107, 118],
+
+            # techprod sub-slices [128–160]
+            "sub_dims":     [128, 139],
+            "digital_dims": [139, 150],
+            "std_dims":     [150, 160],
+
+            # narrative sub-slice [192–224]
+            "env_dims":     [192, 203],
+
+            # agency block [288–320]
+            "agency":       [288, 320],
         }
 
-        # ============================================
-        # Core Logic
-        # ============================================
-        def find_file_in_dir(directory):
-            for root, dirs, files in os.walk(directory):
-                files = [f for f in files if not f.endswith(".meta.json")]
-                if files:
-                    found = os.path.join(root, files[0])
-                    logger.info("Found file: %s", found)
-                    return found
-            raise FileNotFoundError(f"No file found in directory: {directory}")
+        # ================================================================
+        # Hardcoded: FIELD_REGIME_MAP
+        # ================================================================
+        FIELD_REGIME_MAP = {
+            # PESTLE (6)
+            "PESTLE_P":        "political",
+            "PESTLE_E":        "measurement",
+            "PESTLE_S":        "operational",
+            "PESTLE_T":        "techprod",
+            "PESTLE_L":        "regulatory",
+            "PESTLE_Env":      "env_dims",
 
-        def load_e_m(path: str) -> dict:
-            with open(path, 'r') as f:
-                raw = json.load(f)
-            return {market: np.array(vec, dtype=np.float32) for market, vec in raw.items()}
+            # 5 Forces + Contractibility (6)
+            "5F_Supplier":     "supply_dims",
+            "5F_Buyer":        "buyer_dims",
+            "5F_NewEntrant":   "entry_dims",
+            "5F_Substitute":   "sub_dims",
+            "5F_Rivalry":      "rivalry_dims",
+            "Contractibility": "enforce_dims",
 
-        def load_regime_dims(path: str) -> dict:
-            with open(path, 'r') as f:
-                return json.load(f)
+            # Data (2)
+            "DataExhaust":     "digital_dims",
+            "StdGap":          "std_dims",
+        }
 
-        def validate_e_m(e_m: np.ndarray, regime_dims: dict) -> None:
-            if not np.isfinite(e_m).all():
-                raise ValueError("Non-finite values in e_m")
-            total_dim = e_m.shape[0]
-            for regime, (start, end) in regime_dims.items():
-                if end > total_dim:
-                    raise ValueError(f"Regime '{regime}' end={end} exceeds e_m dim={total_dim}")
+        FIELDS = list(FIELD_REGIME_MAP.keys())
 
-        def compute_normality_scores(e_m: np.ndarray, regime_dims: dict, field_regime: dict) -> dict:
-            validate_e_m(e_m, regime_dims)
-            total_norm = np.linalg.norm(e_m)
-            if total_norm == 0:
-                return {
-                    field: {'error_fraction': np.nan, 'structural_normality': np.nan, 'regime': regime}
-                    for field, regime in field_regime.items()
-                }
+        # ================================================================
+        # Core computation helpers
+        # ================================================================
+        def compute_normality_for_row(e_m: np.ndarray) -> dict:
+            total_norm = float(np.linalg.norm(e_m))
+            if total_norm == 0 or not np.isfinite(total_norm):
+                return {f: np.nan for f in FIELDS}
+
             results = {}
-            for field, regime in field_regime.items():
-                if regime not in regime_dims:
-                    results[field] = {'error_fraction': np.nan, 'structural_normality': np.nan, 'regime': regime}
-                    continue
-                start, end = regime_dims[regime]
+            for field, regime_key in FIELD_REGIME_MAP.items():
+                start, end = REGIME_DIMS[regime_key]
                 sub_norm   = float(np.linalg.norm(e_m[start:end]))
-                fraction   = sub_norm / float(total_norm)
+                fraction   = sub_norm / total_norm
                 normality  = float(np.clip(1.0 - fraction, 0.0, 1.0))
-                results[field] = {
-                    'error_fraction':       round(fraction,  6),
-                    'structural_normality': round(normality, 6),
-                    'regime':               regime,
-                }
+                results[field] = round(normality, args.round_decimals)
             return results
 
-        def build_normality_dataframes(e_m_dict: dict, regime_dims: dict, field_regime: dict):
-            normality_rows, fraction_rows = [], []
-            for market, e_m in e_m_dict.items():
-                scores = compute_normality_scores(e_m, regime_dims, field_regime)
-                normality_row = {'Market': market}
-                fraction_row  = {'Market': market}
-                for field, vals in scores.items():
-                    normality_row[field] = vals['structural_normality']
-                    fraction_row[field]  = vals['error_fraction']
-                normality_rows.append(normality_row)
-                fraction_rows.append(fraction_row)
-            df_normality = pd.DataFrame(normality_rows).set_index('Market')
-            df_fraction  = pd.DataFrame(fraction_rows).set_index('Market')
-            return df_normality, df_fraction
+        def compute_fraction_for_row(e_m: np.ndarray) -> dict:
+            total_norm = float(np.linalg.norm(e_m))
+            if total_norm == 0 or not np.isfinite(total_norm):
+                return {f: np.nan for f in FIELDS}
 
+            results = {}
+            for field, regime_key in FIELD_REGIME_MAP.items():
+                start, end = REGIME_DIMS[regime_key]
+                sub_norm   = float(np.linalg.norm(e_m[start:end]))
+                results[field] = round(sub_norm / total_norm, args.round_decimals)
+            return results
+
+        def compute_all_years(df: pd.DataFrame) -> tuple:
+            norm_records     = []
+            fraction_records = [] if EMIT_FRACTIONS else None
+
+            for _, row in df.iterrows():
+                missing = [c for c in E_COLS if c not in row]
+                if missing:
+                    logger.warning("Row market=%s year=%s missing %d e_m cols — skipping",
+                                   row.get("market"), row.get("year"), len(missing))
+                    continue
+
+                e_m    = np.array(row[E_COLS].values, dtype=np.float32)
+                base   = {"market": row["market"], "year": int(row["year"])}
+
+                norm_row = dict(base)
+                norm_row.update(compute_normality_for_row(e_m))
+                norm_records.append(norm_row)
+
+                if EMIT_FRACTIONS:
+                    frac_row = dict(base)
+                    frac_row.update(compute_fraction_for_row(e_m))
+                    fraction_records.append(frac_row)
+
+            df_norm = pd.DataFrame(norm_records)
+            df_frac = pd.DataFrame(fraction_records) if EMIT_FRACTIONS else None
+            return df_norm, df_frac
+
+        def get_latest_year(df_all: pd.DataFrame) -> pd.DataFrame:
+            idx = df_all.groupby("market")["year"].idxmax()
+            return df_all.loc[idx].drop(columns=["year"]).set_index("market")
+
+        def report_nulls(df: pd.DataFrame, label: str) -> None:
+            null_counts = df.isna().sum()
+            null_counts  = null_counts[null_counts > 0]
+            if not null_counts.empty:
+                logger.warning("Null scores in %s:", label)
+                for field, cnt in null_counts.items():
+                    markets = df[df[field].isna()].index.tolist()
+                    logger.warning("  %s (%d nulls): %s", field, cnt, markets)
+            else:
+                logger.info("✓ No null scores in %s", label)
+
+        # ================================================================
+        # Main
+        # ================================================================
         try:
-            # ============================================
-            # Load Inputs
-            # ============================================
-            e_m_file         = find_file_in_dir(args.e_m)
-            regime_dims_file = find_file_in_dir(args.regime_dims)
+            csv_path = os.path.join(args.e_m_data, "mock_e_m.csv")
+            logger.info("Loading e_m embeddings from: %s", csv_path)
+            df_raw = pd.read_csv(csv_path)
+            assert "market" in df_raw.columns, "Missing 'market' column"
+            assert "year"   in df_raw.columns, "Missing 'year' column"
+            assert "e_0"    in df_raw.columns, "Missing e_m vector columns (e_0 ...)"
+            logger.info("Loaded shape=%s  total_vector_size=%d  output_mode=%s  emit_fractions=%s",
+                        df_raw.shape, TOTAL_VECTOR_SIZE, args.output_mode, EMIT_FRACTIONS)
 
-            logger.info("Loading e_m from: %s", e_m_file)
-            e_m_dict = load_e_m(e_m_file)
-            logger.info("Loaded e_m for %d markets, dim=%d", len(e_m_dict), next(iter(e_m_dict.values())).shape[0])
+            # ── Compute ──────────────────────────────────────────────────
+            df_all_norm, df_all_frac = compute_all_years(df_raw)
+            df_latest_norm           = get_latest_year(df_all_norm)
 
-            logger.info("Loading regime_dims from: %s", regime_dims_file)
-            regime_dims = load_regime_dims(regime_dims_file)
-            logger.info("Loaded %d regime dim blocks", len(regime_dims))
+            logger.info("=== Structural Normality (latest year) ===")
+            logger.info("%s", df_latest_norm.round(4).to_string())
+            report_nulls(df_latest_norm, "latest-year normality")
 
-            # ============================================
-            # Compute
-            # ============================================
-            df_normality, df_fraction = build_normality_dataframes(e_m_dict, regime_dims, FIELD_REGIME_MAP)
+            # ── Output dirs ──────────────────────────────────────────────
+            os.makedirs(args.structural_normality,            exist_ok=True)
+            os.makedirs(args.structural_normality_all_years,  exist_ok=True)
 
-            logger.info("=== Structural Normality ===")
-            logger.info("%s", df_normality.round(4).to_string())
-            logger.info("=== Error Fractions ===")
-            logger.info("%s", df_fraction.round(4).to_string())
+            latest_path   = os.path.join(args.structural_normality,           "structural_normality.csv")
+            all_yrs_path  = os.path.join(args.structural_normality_all_years, "structural_normality_all_years.csv")
+            frac_lat_path = os.path.join(args.structural_normality,           "error_fraction.csv")
+            frac_all_path = os.path.join(args.structural_normality_all_years, "error_fraction_all_years.csv")
 
-            # Bounds check
-            assert (df_normality.dropna() >= 0).all().all(), "Normality below 0"
-            assert (df_normality.dropna() <= 1).all().all(), "Normality above 1"
-            logger.info("Bounds check [0,1]: passed")
+            mode = args.output_mode
 
-            # ============================================
-            # Save Outputs
-            # ============================================
-            os.makedirs(args.structural_normality, exist_ok=True)
-            os.makedirs(args.error_fractions, exist_ok=True)
+            # ── Latest year ──────────────────────────────────────────────
+            if mode in ("latest", "both"):
+                df_latest_norm.round(args.round_decimals).to_csv(latest_path)
+                logger.info("Saved latest-year normality → %s", latest_path)
 
-            normality_path = os.path.join(args.structural_normality, "structural_normality.csv")
-            fraction_path  = os.path.join(args.error_fractions, "error_fractions.csv")
+                if EMIT_FRACTIONS and df_all_frac is not None:
+                    df_latest_frac = get_latest_year(df_all_frac)
+                    df_latest_frac.round(args.round_decimals).to_csv(frac_lat_path)
+                    logger.info("Saved latest-year fractions → %s", frac_lat_path)
+            else:
+                pd.DataFrame().to_csv(latest_path)
+                logger.info("output_mode=%s: skipped latest-year (placeholder written)", mode)
 
-            df_normality.round(6).to_csv(normality_path)
-            df_fraction.round(6).to_csv(fraction_path)
+            # ── All years ────────────────────────────────────────────────
+            if mode in ("all", "both"):
+                df_all_norm.round(args.round_decimals).to_csv(all_yrs_path, index=False)
+                logger.info("Saved all-years normality → %s", all_yrs_path)
 
-            logger.info("Saved structural normality → %s", normality_path)
-            logger.info("Saved error fractions      → %s", fraction_path)
+                if EMIT_FRACTIONS and df_all_frac is not None:
+                    df_all_frac.round(args.round_decimals).to_csv(frac_all_path, index=False)
+                    logger.info("Saved all-years fractions → %s", frac_all_path)
+            else:
+                pd.DataFrame().to_csv(all_yrs_path, index=False)
+                logger.info("output_mode=%s: skipped all-years (placeholder written)", mode)
 
-            # Write metadata
+            # ── Assertions ───────────────────────────────────────────────
+            valid = df_latest_norm.dropna()
+            assert (valid >= 0).all().all(), "Normality score below 0 detected"
+            assert (valid <= 1).all().all(), "Normality score above 1 detected"
+            assert len(FIELD_REGIME_MAP) == 14, "Expected 14 fields in FIELD_REGIME_MAP"
+            logger.info("✓ 14 fields confirmed")
+            logger.info("✓ Bounds [0,1] passed")
+            logger.info("✓ All years rows: %d", len(df_all_norm))
+            logger.info("✓ Latest year markets: %d", len(df_latest_norm))
+
+            # ── Metadata ─────────────────────────────────────────────────
             with open(args.structural_normality + ".meta.json", "w") as f:
-                json.dump({"path": normality_path, "markets": len(df_normality), "fields": len(df_normality.columns)}, f, indent=2)
-            with open(args.error_fractions + ".meta.json", "w") as f:
-                json.dump({"path": fraction_path, "markets": len(df_fraction), "fields": len(df_fraction.columns)}, f, indent=2)
+                json.dump({
+                    "path":              latest_path,
+                    "output_mode":       mode,
+                    "markets":           len(df_latest_norm),
+                    "fields":            len(df_latest_norm.columns),
+                    "total_vector_size": TOTAL_VECTOR_SIZE,
+                    "emit_fractions":    EMIT_FRACTIONS,
+                }, f, indent=2)
+
+            with open(args.structural_normality_all_years + ".meta.json", "w") as f:
+                json.dump({
+                    "path":              all_yrs_path,
+                    "output_mode":       mode,
+                    "rows":              len(df_all_norm),
+                    "fields":            len(df_all_norm.columns) - 2,
+                    "total_vector_size": TOTAL_VECTOR_SIZE,
+                    "emit_fractions":    EMIT_FRACTIONS,
+                }, f, indent=2)
 
         except Exception as e:
             logger.exception("Fatal error: %s", str(e))
             sys.exit(1)
 
     args:
-      - --e_m
-      - {inputPath: e_m}
-      - --regime_dims
-      - {inputPath: regime_dims}
+      - --e_m_data
+      - {inputPath: e_m_data}
+      - --output_mode
+      - {inputValue: output_mode}
+      - --total_vector_size
+      - {inputValue: total_vector_size}
+      - --output_fractions
+      - {inputValue: output_fractions}
+      - --round_decimals
+      - {inputValue: round_decimals}
       - --structural_normality
       - {outputPath: structural_normality}
-      - --error_fractions
-      - {outputPath: error_fractions}
+      - --structural_normality_all_years
+      - {outputPath: structural_normality_all_years}
