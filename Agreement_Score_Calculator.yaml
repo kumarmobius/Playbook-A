@@ -1,4 +1,4 @@
-name: Agreement Score Calculator V1.2
+name: Agreement Score Calculator V1.3
 inputs:
   - {name: embeddings,     type: Data,    description: "Path to mock_embeddings.csv"}
   - {name: regime_dim,     type: Integer, default: "32",          description: "Dimensionality of each regime embedding vector"}
@@ -168,8 +168,8 @@ implementation:
                 return path
 
             raise FileNotFoundError(
-                f"No readable input file found in: {input_dir}\n"
-                f"  Contents: {os.listdir(input_dir)}"
+                f"No readable input file found in: {input_dir}"
+                f"Contents: {os.listdir(input_dir)}"
             )
 
         try:
