@@ -1,15 +1,9 @@
-name: Agreement Score Calculator V1.1
-description: >
-  Computes embedding-based agreement scores for each market using cosine
-  similarity across regime vectors. Supports output of latest-year scores
-  or all-years scores. FIELD_CONFIG and SUB_REGIME_SLICES are hardcoded.
-  REGIME_DIM is configurable (default 32).
-
+name: Agreement Score Calculator V1.2
 inputs:
   - {name: embeddings,     type: Data,    description: "Path to mock_embeddings.csv"}
-  - {name: regime_dim,     type: Integer, default: 32,          description: "Dimensionality of each regime embedding vector"}
+  - {name: regime_dim,     type: Integer, default: "32",          description: "Dimensionality of each regime embedding vector"}
   - {name: output_mode,    type: String,  default: "latest",    description: "Output mode: 'latest' for latest year only, 'all' for all years"}
-  - {name: round_decimals, type: Integer, default: 6,           description: "Decimal places to round agreement scores"}
+  - {name: round_decimals, type: Integer, default: "6",           description: "Decimal places to round agreement scores"}
 
 outputs:
   - {name: agreement_scores, type: Data, description: "agreement_scores.csv (latest year, indexed by market)"}
