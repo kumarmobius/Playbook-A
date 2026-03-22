@@ -1,5 +1,5 @@
-name: Structural Normality Calculator V1.1
-description: Computes structural normality per market x year from e_m regime sub-vector norms. Outputs latest, all-years, or both. REGIME_DIMS and FIELD_REGIME_MAP hardcoded.
+name: Structural Normality Calculator  V2
+description: "Computes structural normality per market x year from e_m regime sub-vector norms. Outputs latest, all-years, or both. REGIME_DIMS configurable via JSON input; FIELD_REGIME_MAP hardcoded."
 
 inputs:
   - {name: e_m_data,           type: Data,    description: "Input directory containing the e_m embeddings CSV file"}
@@ -7,6 +7,7 @@ inputs:
   - {name: total_vector_size,  type: Integer, default: "320",   description: "Total dimensionality of the e_m embedding vector (e_0 to e_N-1)"}
   - {name: output_fractions,   type: String,  default: "false", description: "Set true to also save error_fraction CSVs alongside normality CSVs"}
   - {name: round_decimals,     type: Integer, default: "6",     description: "Decimal places to round output scores"}
+  - {name: regime_dims,        type: String,  description: "Required JSON string mapping regime_key to [start, end] e.g. {political:[0,32],techprod:[128,160]}"}
 
 outputs:
   - {name: structural_normality,          type: Data, description: "structural_normality.csv — latest year per market (indexed by market)"}
@@ -32,6 +33,8 @@ implementation:
         parser.add_argument('--output_fractions',                 type=str,  default='false',
                             help="'true' to also emit error_fraction CSVs")
         parser.add_argument('--round_decimals',                   type=int,  default=6)
+        parser.add_argument('--regime_dims',                      type=str,  default='{}',
+                            help='JSON string mapping regime_key to [start, end]')
         parser.add_argument('--structural_normality',             required=True)
         parser.add_argument('--structural_normality_all_years',   required=True)
         args = parser.parse_args()
@@ -43,42 +46,10 @@ implementation:
         TOTAL_VECTOR_SIZE = args.total_vector_size
         E_COLS            = [f"e_{i}" for i in range(TOTAL_VECTOR_SIZE)]
 
-        # ================================================================
-        # Hardcoded: REGIME_DIMS
-        # Format: regime_key -> [start, end]  (end exclusive)
-        # ================================================================
-        REGIME_DIMS = {
-            # 9 full regime blocks (32 dims each)
-            "political":    [0,   32],
-            "measurement":  [32,  64],
-            "coordination": [64,  96],
-            "regulatory":   [96,  128],
-            "techprod":     [128, 160],
-            "operational":  [160, 192],
-            "narrative":    [192, 224],
-            "incentive":    [224, 256],
-            "temporal":     [256, 288],
-
-            # coordination sub-slices [64–96]
-            "supply_dims":  [64,  75],
-            "buyer_dims":   [75,  85],
-            "rivalry_dims": [85,  96],
-
-            # regulatory sub-slices [96–128]
-            "entry_dims":   [96,  107],
-            "enforce_dims": [107, 118],
-
-            # techprod sub-slices [128–160]
-            "sub_dims":     [128, 139],
-            "digital_dims": [139, 150],
-            "std_dims":     [150, 160],
-
-            # narrative sub-slice [192–224]
-            "env_dims":     [192, 203],
-
-            # agency block [288–320]
-            "agency":       [288, 320],
-        }
+        if not args.regime_dims or args.regime_dims.strip() in ('{}', '', 'null'):
+            raise ValueError("regime_dims is required — pass a non-empty JSON string mapping regime_key to [start, end]")
+        REGIME_DIMS = {k: [int(v[0]), int(v[1])] for k, v in json.loads(args.regime_dims).items()}
+        logger.info("REGIME_DIMS loaded from input  keys=%d", len(REGIME_DIMS))
 
         # ================================================================
         # Hardcoded: FIELD_REGIME_MAP
@@ -126,10 +97,6 @@ implementation:
         def compute_fraction_for_row(e_m: np.ndarray) -> dict:
             fracs = _regime_fractions(e_m)
             return {f: round(v, args.round_decimals) if not np.isnan(v) else np.nan for f, v in fracs.items()}
-
-        # ================================================================
-        # Process all rows
-        # ================================================================
         def compute_all_years(df: pd.DataFrame) -> tuple:
             norm_records     = []
             fraction_records = [] if EMIT_FRACTIONS else None
@@ -297,6 +264,8 @@ implementation:
       - {inputValue: output_fractions}
       - --round_decimals
       - {inputValue: round_decimals}
+      - --regime_dims
+      - {inputValue: regime_dims}
       - --structural_normality
       - {outputPath: structural_normality}
       - --structural_normality_all_years
