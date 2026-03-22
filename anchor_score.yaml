@@ -1,0 +1,224 @@
+name: Anchor Score Calculator
+description: "Computes discounted anchor scores per country x year by merging raw scores with constraint metrics. Outputs latest, all-years, or both. RAW_TO_T1 and FIELD_CONSTRAINTS hardcoded."
+
+inputs:
+  - {name: raw_scores,        type: Data,    description: "Input directory containing the raw scores CSV file"}
+  - {name: constraint_metrics, type: Data,   description: "Input directory containing the constraint metrics CSV file"}
+  - {name: output_mode,       type: String,  default: "both", description: "Output mode: latest, all, or both"}
+  - {name: round_decimals,    type: Integer, default: "6",    description: "Decimal places to round output anchor scores"}
+
+outputs:
+  - {name: anchor_scores,          type: Data, description: "anchor_scores.csv — latest year per country (indexed by 2-letter code)"}
+  - {name: anchor_scores_all_years, type: Data, description: "anchor_scores_all_years.csv — all years (no index)"}
+
+implementation:
+  container:
+    image: gurpreetgandhi/nesy-factory:v1
+    command:
+      - python3
+      - -u
+      - -c
+      - |
+        import argparse, os, sys, json, logging
+        import numpy as np
+        import pandas as pd
+
+        parser = argparse.ArgumentParser()
+        parser.add_argument('--raw_scores',               required=True)
+        parser.add_argument('--constraint_metrics',       required=True)
+        parser.add_argument('--output_mode',              type=str, default='both',
+                            choices=['latest', 'all', 'both'])
+        parser.add_argument('--round_decimals',           type=int, default=6)
+        parser.add_argument('--anchor_scores',            required=True)
+        parser.add_argument('--anchor_scores_all_years',  required=True)
+        args = parser.parse_args()
+
+        logging.basicConfig(stream=sys.stdout, level=logging.INFO)
+        logger = logging.getLogger("anchor_score_calculator")
+
+        TWO_TO_ISO3 = {"DE":"DEU","IN":"IND","NL":"NLD","NG":"NGA","US":"USA"}
+        ISO3_TO_TWO = {v:k for k,v in TWO_TO_ISO3.items()}
+
+        RAW_TO_T1 = {
+            "wgi_composite":     "PESTLE_P",
+            "gdp_growth":        "PESTLE_E",
+            "lfpr":              "PESTLE_S",
+            "digital_index":     "PESTLE_T",
+            "business_readiness":"PESTLE_L",
+            "env_policy":        "PESTLE_Env",
+            "supplier_hhi":      "5F_Supplier",
+            "buyer_hhi":         "5F_Buyer",
+            "entry_ease":        "5F_NewEntrant",
+            "digital_growth":    "5F_Substitute",
+            "market_hhi":        "5F_Rivalry",
+            "contractibility":   "Contractibility",
+            "digital_biz":       "DataExhaust",
+            "hs_fragmentation":  "StdGap",
+        }
+
+        FIELD_CONSTRAINTS = {
+            "wgi_composite":     ["incentive_to_report", "temporal_lag"],
+            "gdp_growth":        ["program_bias",         "revision_lag"],
+            "lfpr":              ["informality_observ"],
+            "digital_index":     ["selection_bias"],
+            "business_readiness":["methodology_drift"],
+            "env_policy":        ["greenwashing"],
+            "supplier_hhi":      ["observability"],
+            "buyer_hhi":         ["observability"],
+            "entry_ease":        ["path_dependence", "selection_bias"],
+            "digital_growth":    ["semantic_drift"],
+            "market_hhi":        ["observability"],
+            "contractibility":   [],
+            "digital_biz":       [],
+            "hs_fragmentation":  ["hs_drift"],
+        }
+
+        def resolve_csv_path(input_dir, stem):
+            candidates = [
+                os.path.join(input_dir, stem + ".csv"),
+                os.path.join(input_dir, stem),
+            ]
+            for path in candidates:
+                if os.path.isfile(path):
+                    logger.info("Resolved input file: %s", path)
+                    return path
+            for fname in os.listdir(input_dir):
+                if fname.endswith(".csv"):
+                    path = os.path.join(input_dir, fname)
+                    logger.warning("Fallback CSV file used: %s", path)
+                    return path
+            all_files = [f for f in os.listdir(input_dir) if os.path.isfile(os.path.join(input_dir, f))]
+            if all_files:
+                path = os.path.join(input_dir, all_files[0])
+                logger.warning("Last-resort file used: %s", path)
+                return path
+            raise FileNotFoundError("No readable input file found in: %s  contents: %s" % (input_dir, os.listdir(input_dir)))
+
+        def load_and_align(raw_dir, cm_dir):
+            df_raw = pd.read_csv(resolve_csv_path(raw_dir, "mock_raw_scores"))
+            df_cm  = pd.read_csv(resolve_csv_path(cm_dir,  "fixed_constraint_metrics"))
+            if df_raw["country"].iloc[0] in TWO_TO_ISO3:
+                df_raw["country"] = df_raw["country"].map(TWO_TO_ISO3)
+            targets = list(TWO_TO_ISO3.values())
+            df_raw  = df_raw[df_raw["country"].isin(targets)].copy()
+            df_cm   = df_cm[df_cm["country"].isin(targets)].copy()
+            return pd.merge(df_raw, df_cm, on=["country","year"], how="inner")
+
+        def compute_anchor_row(row):
+            results = {}
+            for raw_field, t1_field in RAW_TO_T1.items():
+                val = row.get(raw_field)
+                if val is None or (isinstance(val, float) and np.isnan(val)):
+                    results[t1_field] = np.nan
+                    continue
+                norm_val = float(np.clip(val, 0.0, 1.0))
+                discount = 1.0
+                for col in FIELD_CONSTRAINTS[raw_field]:
+                    v = row.get(col)
+                    if v is not None and not np.isnan(float(v)):
+                        discount *= (1.0 - float(v))
+                if raw_field == "business_readiness":
+                    wits = row.get("wits_enforcement")
+                    if wits is not None and not np.isnan(float(wits)):
+                        discount *= float(np.clip(wits, 0.0, 1.0))
+                results[t1_field] = round(norm_val * discount, args.round_decimals)
+            return results
+
+        def compute_all_anchors(df):
+            records = []
+            for _, row in df.iterrows():
+                d = row.to_dict()
+                anchors = compute_anchor_row(d)
+                record = {"country": row["country"], "year": int(row["year"])}
+                record.update(anchors)
+                records.append(record)
+            return pd.DataFrame(records)
+
+        def get_latest_year(df_all):
+            idx = df_all.groupby("country")["year"].idxmax()
+            df  = df_all.loc[idx].drop(columns=["year"])
+            df["country"] = df["country"].map(ISO3_TO_TWO)
+            return df.set_index("country")
+
+        def report_nulls(df_latest):
+            null_counts = df_latest.isna().sum()
+            null_counts  = null_counts[null_counts > 0]
+            if not null_counts.empty:
+                logger.warning("Null anchor scores detected:")
+                for field, count in null_counts.items():
+                    countries = df_latest[df_latest[field].isna()].index.tolist()
+                    logger.warning("  %s (%d): %s", field, count, countries)
+            else:
+                logger.info("No null anchor scores found.")
+
+        try:
+            logger.info("Scanning raw_scores dir: %s  contents=%s", args.raw_scores, os.listdir(args.raw_scores))
+            logger.info("Scanning constraint_metrics dir: %s  contents=%s", args.constraint_metrics, os.listdir(args.constraint_metrics))
+
+            df_merged = load_and_align(args.raw_scores, args.constraint_metrics)
+            logger.info("Merged shape=%s  output_mode=%s", df_merged.shape, args.output_mode)
+
+            df_all    = compute_all_anchors(df_merged)
+            df_latest = get_latest_year(df_all)
+
+            logger.info("=== Anchor Scores (latest year) ===")
+            logger.info("%s", df_latest.round(4).to_string())
+            report_nulls(df_latest)
+
+            os.makedirs(args.anchor_scores,            exist_ok=True)
+            os.makedirs(args.anchor_scores_all_years,  exist_ok=True)
+
+            latest_path  = os.path.join(args.anchor_scores,           "anchor_scores.csv")
+            all_yrs_path = os.path.join(args.anchor_scores_all_years, "anchor_scores_all_years.csv")
+
+            mode = args.output_mode
+
+            if mode in ("latest", "both"):
+                df_latest.round(args.round_decimals).to_csv(latest_path)
+                logger.info("Saved latest-year anchor scores -> %s", latest_path)
+            else:
+                pd.DataFrame().to_csv(latest_path)
+                logger.info("output_mode=%s: skipped latest-year (placeholder written)", mode)
+
+            if mode in ("all", "both"):
+                df_all.round(args.round_decimals).to_csv(all_yrs_path, index=False)
+                logger.info("Saved all-years anchor scores -> %s", all_yrs_path)
+            else:
+                pd.DataFrame().to_csv(all_yrs_path, index=False)
+                logger.info("output_mode=%s: skipped all-years (placeholder written)", mode)
+
+            with open(args.anchor_scores + ".meta.json", "w") as f:
+                json.dump({
+                    "path":           latest_path,
+                    "output_mode":    mode,
+                    "countries":      len(df_latest),
+                    "fields":         len(df_latest.columns),
+                    "round_decimals": args.round_decimals,
+                }, f, indent=2)
+
+            with open(args.anchor_scores_all_years + ".meta.json", "w") as f:
+                json.dump({
+                    "path":           all_yrs_path,
+                    "output_mode":    mode,
+                    "rows":           len(df_all),
+                    "fields":         len(df_all.columns) - 2,
+                    "round_decimals": args.round_decimals,
+                }, f, indent=2)
+
+        except Exception as e:
+            logger.exception("Fatal error: %s", str(e))
+            sys.exit(1)
+
+    args:
+      - --raw_scores
+      - {inputPath: raw_scores}
+      - --constraint_metrics
+      - {inputPath: constraint_metrics}
+      - --output_mode
+      - {inputValue: output_mode}
+      - --round_decimals
+      - {inputValue: round_decimals}
+      - --anchor_scores
+      - {outputPath: anchor_scores}
+      - --anchor_scores_all_years
+      - {outputPath: anchor_scores_all_years}
