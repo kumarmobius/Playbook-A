@@ -1,4 +1,4 @@
-name: Structural Normality Calculator V1
+name: Structural Normality Calculator V1.1
 description: Computes structural normality per market x year from e_m regime sub-vector norms. Outputs latest, all-years, or both. REGIME_DIMS and FIELD_REGIME_MAP hardcoded.
 
 inputs:
@@ -131,10 +131,6 @@ implementation:
         # Process all rows
         # ================================================================
         def compute_all_years(df: pd.DataFrame) -> tuple:
-            """
-            Returns (df_normality, df_fractions) — both market | year | fields.
-            df_fractions is None if EMIT_FRACTIONS is False.
-            """
             norm_records     = []
             fraction_records = [] if EMIT_FRACTIONS else None
 
