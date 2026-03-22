@@ -1,12 +1,15 @@
-name: Agreement Score Calculator V1
-description: Computes embedding-based agreement scores for each market using cosine   similarity across regime vectors. Supports output of latest-year scores
+name: Agreement Score Calculator V1.1
+description: >
+  Computes embedding-based agreement scores for each market using cosine
+  similarity across regime vectors. Supports output of latest-year scores
   or all-years scores. FIELD_CONFIG and SUB_REGIME_SLICES are hardcoded.
   REGIME_DIM is configurable (default 32).
+
 inputs:
   - {name: embeddings,     type: Data,    description: "Path to mock_embeddings.csv"}
-  - {name: regime_dim,     type: Integer, default: "32",          description: "Dimensionality of each regime embedding vector"}
+  - {name: regime_dim,     type: Integer, default: 32,          description: "Dimensionality of each regime embedding vector"}
   - {name: output_mode,    type: String,  default: "latest",    description: "Output mode: 'latest' for latest year only, 'all' for all years"}
-  - {name: round_decimals, type: Integer, default: "6",           description: "Decimal places to round agreement scores"}
+  - {name: round_decimals, type: Integer, default: 6,           description: "Decimal places to round agreement scores"}
 
 outputs:
   - {name: agreement_scores, type: Data, description: "agreement_scores.csv (latest year, indexed by market)"}
@@ -145,12 +148,40 @@ implementation:
                     logger.warning("  %s (%d): %s", field, cnt, markets)
             else:
                 logger.info("No null agreement scores found.")
+        def resolve_csv_path(input_dir: str) -> str:
+            candidates = [
+                os.path.join(input_dir, "mock_embeddings.csv"),
+                os.path.join(input_dir, "mock_embeddings"),
+            ]
+            for path in candidates:
+                if os.path.isfile(path):
+                    logger.info("Resolved input file: %s", path)
+                    return path
 
-        # ============================================================
-        # Main
-        # ============================================================
+            # Fallback: scan directory for any csv
+            for fname in os.listdir(input_dir):
+                if fname.endswith(".csv"):
+                    path = os.path.join(input_dir, fname)
+                    logger.warning("Used fallback CSV file: %s", path)
+                    return path
+
+            # Last resort: first file in directory
+            all_files = [f for f in os.listdir(input_dir)
+                         if os.path.isfile(os.path.join(input_dir, f))]
+            if all_files:
+                path = os.path.join(input_dir, all_files[0])
+                logger.warning("Used last-resort file: %s", path)
+                return path
+
+            raise FileNotFoundError(
+                f"No readable input file found in: {input_dir}\n"
+                f"  Contents: {os.listdir(input_dir)}"
+            )
+
         try:
-            csv_path = os.path.join(args.embeddings, "mock_embeddings.csv")
+            logger.info("Scanning input dir: %s  contents=%s",
+                        args.embeddings, os.listdir(args.embeddings))
+            csv_path = resolve_csv_path(args.embeddings)
             logger.info("Loading embeddings from: %s", csv_path)
             df = pd.read_csv(csv_path)
             logger.info("Loaded shape=%s  REGIME_DIM=%d  mode=%s",
