@@ -1,11 +1,12 @@
-name: Confidence Score Calculator
-description: "Computes sigmoid-based confidence scores per market x year from sigma vectors. Outputs latest, all-years, or both. FIELD_TO_REGIME and REGIME_DIMS hardcoded."
+name: Confidence Score Calculator V1
+description: "Computes sigmoid-based confidence scores per market x year from sigma vectors. Outputs latest, all-years, or both. REGIME_DIMS configurable via JSON input; FIELD_TO_REGIME hardcoded."
 
 inputs:
   - {name: sigma_data,       type: Data,    description: "Input directory containing the sigma embeddings CSV file"}
   - {name: threshold_config, type: Data,    description: "Input directory containing sigma_threshold.json with sigma_threshold key"}
   - {name: latent_dim,       type: Integer, default: "320",  description: "Total dimensionality of the sigma vector (s_0 to s_N-1)"}
-  - {name: k_steepness,      type: String,  default: "5.0",  description: "Sigmoid steepness constant K used in confidence computation"}
+  - {name: k_steepness,      type: Integer, default: "5",    description: "Sigmoid steepness scaling factor K (integer) used in confidence computation"}
+  - {name: regime_dims,       type: String,  description: "Required JSON string mapping regime_key to [start, end] e.g. {political:[0,32]}"}
   - {name: output_mode,      type: String,  default: "both", description: "Output mode: latest, all, or both"}
   - {name: round_decimals,   type: Integer, default: "6",    description: "Decimal places to round output confidence scores"}
 
@@ -29,7 +30,8 @@ implementation:
         parser.add_argument('--sigma_data',                      required=True)
         parser.add_argument('--threshold_config',                required=True)
         parser.add_argument('--latent_dim',                      type=int,   default=320)
-        parser.add_argument('--k_steepness',                     type=float, default=5.0)
+        parser.add_argument('--k_steepness',                     type=int,   default=5)
+        parser.add_argument('--regime_dims',                      type=str,   required=True)
         parser.add_argument('--output_mode',                     type=str,   default='both',
                             choices=['latest', 'all', 'both'])
         parser.add_argument('--round_decimals',                  type=int,   default=6)
@@ -41,30 +43,13 @@ implementation:
         logger = logging.getLogger("confidence_score_calculator")
 
         LATENT_DIM = args.latent_dim
-        K          = args.k_steepness
+        K          = float(args.k_steepness)
         SIGMA_COLS = [f"s_{i}" for i in range(LATENT_DIM)]
 
-        REGIME_DIMS = {
-            "political":    [0,   32],
-            "measurement":  [32,  64],
-            "coordination": [64,  96],
-            "regulatory":   [96,  128],
-            "techprod":     [128, 160],
-            "operational":  [160, 192],
-            "narrative":    [192, 224],
-            "incentive":    [224, 256],
-            "temporal":     [256, 288],
-            "supply_dims":  [64,  75],
-            "buyer_dims":   [75,  85],
-            "rivalry_dims": [85,  96],
-            "entry_dims":   [96,  107],
-            "enforce_dims": [107, 118],
-            "sub_dims":     [128, 139],
-            "digital_dims": [139, 150],
-            "std_dims":     [150, 160],
-            "env_dims":     [192, 203],
-            "agency":       [288, 320],
-        }
+        if not args.regime_dims or args.regime_dims.strip() in ('{}', '', 'null'):
+            raise ValueError("regime_dims is required — pass a non-empty JSON string mapping regime_key to [start, end]")
+        REGIME_DIMS = {k: [int(v[0]), int(v[1])] for k, v in json.loads(args.regime_dims).items()}
+        logger.info("REGIME_DIMS loaded from input  keys=%d", len(REGIME_DIMS))
 
         FIELD_TO_REGIME = {
             "PESTLE_P":        "political",
@@ -243,6 +228,8 @@ implementation:
       - {inputValue: latent_dim}
       - --k_steepness
       - {inputValue: k_steepness}
+      - --regime_dims
+      - {inputValue: regime_dims}
       - --output_mode
       - {inputValue: output_mode}
       - --round_decimals
