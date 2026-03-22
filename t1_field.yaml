@@ -1,0 +1,225 @@
+name: T1 Score Calculator
+description: "Merges agreement, normality, anchor, and confidence all-years CSVs and computes weighted sigmoid T1 scores per market x year. Outputs latest, all-years, or both."
+
+inputs:
+  - {name: agreement_scores,   type: Data,   description: "Input directory containing agreement_scores_all_years.csv"}
+  - {name: normality_scores,   type: Data,   description: "Input directory containing structural_normality_all_years.csv"}
+  - {name: anchor_scores,      type: Data,   description: "Input directory containing anchor_scores_all_years.csv"}
+  - {name: confidence_scores,  type: Data,   description: "Input directory containing confidence_scores_all_years.csv"}
+  - {name: w1,                 type: String, default: "0.4",  description: "Weight for agreement scores (C1) in weighted sum"}
+  - {name: w2,                 type: String, default: "0.3",  description: "Weight for normality scores (C2) in weighted sum"}
+  - {name: w3,                 type: String, default: "0.3",  description: "Weight for anchor scores (C3) in weighted sum"}
+  - {name: output_mode,        type: String, default: "both", description: "Output mode: latest, all, or both"}
+  - {name: round_decimals,     type: Integer, default: "6",   description: "Decimal places to round output T1 scores"}
+
+outputs:
+  - {name: t1_scores,          type: Data, description: "t1_scores.csv — latest year per market (indexed by market)"}
+  - {name: t1_scores_all_years, type: Data, description: "t1_scores_all_years.csv — all years (no index)"}
+
+implementation:
+  container:
+    image: gurpreetgandhi/nesy-factory:v1
+    command:
+      - python3
+      - -u
+      - -c
+      - |
+        import argparse, os, sys, json, logging
+        import numpy as np
+        import pandas as pd
+
+        parser = argparse.ArgumentParser()
+        parser.add_argument('--agreement_scores',          required=True)
+        parser.add_argument('--normality_scores',          required=True)
+        parser.add_argument('--anchor_scores',             required=True)
+        parser.add_argument('--confidence_scores',         required=True)
+        parser.add_argument('--w1',                        type=float, default=0.4)
+        parser.add_argument('--w2',                        type=float, default=0.3)
+        parser.add_argument('--w3',                        type=float, default=0.3)
+        parser.add_argument('--output_mode',               type=str,   default='both',
+                            choices=['latest', 'all', 'both'])
+        parser.add_argument('--round_decimals',            type=int,   default=6)
+        parser.add_argument('--t1_scores',                 required=True)
+        parser.add_argument('--t1_scores_all_years',       required=True)
+        args = parser.parse_args()
+
+        logging.basicConfig(stream=sys.stdout, level=logging.INFO)
+        logger = logging.getLogger("t1_score_calculator")
+
+        ISO3_TO_MARKET = {
+            "DEU": "DE-HC", "IND": "IN-LOG", "NLD": "NL-AG",
+            "NGA": "NG-FIN", "USA": "US-ENR",
+        }
+        TWO_TO_MARKET = {
+            "DE": "DE-HC", "IN": "IN-LOG", "NL": "NL-AG",
+            "NG": "NG-FIN", "US": "US-ENR",
+        }
+        COUNTRY_MAP = {**ISO3_TO_MARKET, **TWO_TO_MARKET}
+
+        FIELDS = [
+            "PESTLE_P","PESTLE_E","PESTLE_S","PESTLE_T","PESTLE_L","PESTLE_Env",
+            "5F_Supplier","5F_Buyer","5F_NewEntrant","5F_Substitute","5F_Rivalry",
+            "Contractibility","DataExhaust","StdGap",
+        ]
+
+        def resolve_csv_path(input_dir, stem):
+            candidates = [
+                os.path.join(input_dir, stem + ".csv"),
+                os.path.join(input_dir, stem),
+            ]
+            for path in candidates:
+                if os.path.isfile(path):
+                    logger.info("Resolved input file: %s", path)
+                    return path
+            for fname in os.listdir(input_dir):
+                if fname.endswith(".csv"):
+                    path = os.path.join(input_dir, fname)
+                    logger.warning("Fallback CSV file used: %s", path)
+                    return path
+            all_files = [f for f in os.listdir(input_dir) if os.path.isfile(os.path.join(input_dir, f))]
+            if all_files:
+                path = os.path.join(input_dir, all_files[0])
+                logger.warning("Last-resort file used: %s", path)
+                return path
+            raise FileNotFoundError("No readable input file found in: %s  contents: %s" % (input_dir, os.listdir(input_dir)))
+
+        def sigmoid(x):
+            return 1.0 / (1.0 + np.exp(-np.clip(x, -500, 500)))
+
+        def load_inputs():
+            c1 = pd.read_csv(resolve_csv_path(args.agreement_scores,  "agreement_scores_all_years"))
+            c2 = pd.read_csv(resolve_csv_path(args.normality_scores,  "structural_normality_all_years"))
+            c3 = pd.read_csv(resolve_csv_path(args.anchor_scores,     "anchor_scores_all_years"))
+            c4 = pd.read_csv(resolve_csv_path(args.confidence_scores, "confidence_scores_all_years"))
+            c3["market"] = c3["country"].map(COUNTRY_MAP)
+            c3 = c3.dropna(subset=["market"]).drop(columns=["country"])
+            logger.info("C1 agreement:  %s  years=%s", c1.shape, sorted(c1.year.unique().tolist()))
+            logger.info("C2 normality:  %s  years=%s", c2.shape, sorted(c2.year.unique().tolist()))
+            logger.info("C3 anchor:     %s  years=%s", c3.shape, sorted(c3.year.unique().tolist()))
+            logger.info("C4 confidence: %s  years=%s", c4.shape, sorted(c4.year.unique().tolist()))
+            return c1, c2, c3, c4
+
+        def compute_t1(c1, c2, c3, c4):
+            df = (c1.merge(c2, on=["market","year"], suffixes=("_c1","_c2"))
+                    .merge(c3, on=["market","year"], suffixes=("","_c3"))
+                    .merge(c4, on=["market","year"], suffixes=("","_c4")))
+            records = []
+            for _, row in df.iterrows():
+                record = {"market": row["market"], "year": int(row["year"])}
+                for field in FIELDS:
+                    v1 = row.get(f"{field}_c1", row.get(field, np.nan))
+                    v2 = row.get(f"{field}_c2", np.nan)
+                    v3 = row.get(field,          np.nan)
+                    v4 = row.get(f"{field}_c4",  np.nan)
+                    try:
+                        v1, v2, v3, v4 = float(v1), float(v2), float(v3), float(v4)
+                    except (TypeError, ValueError):
+                        record[field] = np.nan
+                        continue
+                    if any(np.isnan(v) for v in [v1, v2, v3, v4]):
+                        record[field] = np.nan
+                    else:
+                        raw           = args.w1 * v1 + args.w2 * v2 + args.w3 * v3
+                        record[field] = round(float(sigmoid(raw) * v4), args.round_decimals)
+                records.append(record)
+            return pd.DataFrame(records)
+
+        def get_latest_year(df_all):
+            idx = df_all.groupby("market")["year"].idxmax()
+            return df_all.loc[idx].drop(columns=["year"]).set_index("market")
+
+        def report_nulls(df):
+            null_counts = df[FIELDS].isna().sum()
+            null_counts  = null_counts[null_counts > 0]
+            if not null_counts.empty:
+                logger.warning("Null T1 scores detected:")
+                for field, cnt in null_counts.items():
+                    logger.warning("  %s: %d null(s)", field, cnt)
+            else:
+                logger.info("No null T1 scores found.")
+
+        try:
+            logger.info("w1=%.2f  w2=%.2f  w3=%.2f  output_mode=%s", args.w1, args.w2, args.w3, args.output_mode)
+
+            c1, c2, c3, c4 = load_inputs()
+            df_all          = compute_t1(c1, c2, c3, c4)
+            df_latest       = get_latest_year(df_all)
+
+            logger.info("All years rows: %d  years=%s", len(df_all), sorted(df_all.year.unique().tolist()))
+            logger.info("=== T1 Scores (latest year) ===")
+            logger.info("%s", df_latest[FIELDS].round(4).to_string())
+            report_nulls(df_all)
+
+            os.makedirs(args.t1_scores,            exist_ok=True)
+            os.makedirs(args.t1_scores_all_years,  exist_ok=True)
+
+            latest_path  = os.path.join(args.t1_scores,           "t1_scores.csv")
+            all_yrs_path = os.path.join(args.t1_scores_all_years, "t1_scores_all_years.csv")
+
+            mode = args.output_mode
+
+            if mode in ("latest", "both"):
+                df_latest.round(args.round_decimals).to_csv(latest_path)
+                logger.info("Saved latest-year T1 scores -> %s", latest_path)
+            else:
+                pd.DataFrame().to_csv(latest_path)
+                logger.info("output_mode=%s: skipped latest-year (placeholder written)", mode)
+
+            if mode in ("all", "both"):
+                df_all.round(args.round_decimals).to_csv(all_yrs_path, index=False)
+                logger.info("Saved all-years T1 scores -> %s", all_yrs_path)
+            else:
+                pd.DataFrame().to_csv(all_yrs_path, index=False)
+                logger.info("output_mode=%s: skipped all-years (placeholder written)", mode)
+
+            with open(args.t1_scores + ".meta.json", "w") as f:
+                json.dump({
+                    "path":          latest_path,
+                    "output_mode":   mode,
+                    "markets":       len(df_latest),
+                    "fields":        len(FIELDS),
+                    "w1":            args.w1,
+                    "w2":            args.w2,
+                    "w3":            args.w3,
+                    "round_decimals": args.round_decimals,
+                }, f, indent=2)
+
+            with open(args.t1_scores_all_years + ".meta.json", "w") as f:
+                json.dump({
+                    "path":          all_yrs_path,
+                    "output_mode":   mode,
+                    "rows":          len(df_all),
+                    "fields":        len(FIELDS),
+                    "w1":            args.w1,
+                    "w2":            args.w2,
+                    "w3":            args.w3,
+                    "round_decimals": args.round_decimals,
+                }, f, indent=2)
+
+        except Exception as e:
+            logger.exception("Fatal error: %s", str(e))
+            sys.exit(1)
+
+    args:
+      - --agreement_scores
+      - {inputPath: agreement_scores}
+      - --normality_scores
+      - {inputPath: normality_scores}
+      - --anchor_scores
+      - {inputPath: anchor_scores}
+      - --confidence_scores
+      - {inputPath: confidence_scores}
+      - --w1
+      - {inputValue: w1}
+      - --w2
+      - {inputValue: w2}
+      - --w3
+      - {inputValue: w3}
+      - --output_mode
+      - {inputValue: output_mode}
+      - --round_decimals
+      - {inputValue: round_decimals}
+      - --t1_scores
+      - {outputPath: t1_scores}
+      - --t1_scores_all_years
+      - {outputPath: t1_scores_all_years}
